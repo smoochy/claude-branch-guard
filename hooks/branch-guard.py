@@ -40,7 +40,10 @@ fail closed.
 In a non-interactive permission mode (auto / dontAsk / bypassPermissions) there
 is no human to answer a prompt, so a would-be `ask` is emitted as `deny`
 instead — the guard fails safe. (`bypassPermissions` ignores hook decisions
-entirely, but emitting `deny` there is harmless and future-proof.)
+entirely, but emitting `deny` there is harmless and future-proof.) A classifier
+reason states only the CAUSE; `confirm()` adds the closing clause, so the two
+paths read honestly — an `ask` offers a confirmation, a `deny` says there is
+none to be had and points at the terminal instead.
 
 Scope note: branch-guard reasons about git/branch *semantics*. The filesystem
 boundary (commands touching paths outside the workspace) is workspace-guard's
@@ -237,12 +240,20 @@ PURE_SUBSTITUTIONS = frozenset({
 PUSH_VALUE_OPTS = {'--repo', '-o', '--push-option', '--receive-pack', '--exec'}
 # `git push` flags that push more than the current branch.
 PUSH_MANY_FLAGS = {'--all', '--mirror', '--branches'}
+# `git push` flags that publish tags alongside (or instead of) a branch. `--tags`
+# pushes every local tag, including release tags unrelated to the worktree
+# branch, so under `strict` it asks like any other non-branch push.
+# `--follow-tags` is deliberately absent: it pushes only annotated tags reachable
+# from the branch already being pushed, and `push.followTags` can enable the same
+# behavior from config where the hook can't see it — see README "Limitations".
+PUSH_TAG_FLAGS = {'--tags'}
 
 # Push-guard policy (env var BRANCH_GUARD_PUSH_POLICY):
 #   strict (default) — auto-approve a push of the worktree's own current branch
 #                      (including force pushes); ask before any other push
 #                      (other branches, foreign refspecs like HEAD:main,
-#                      wildcards, --all/--mirror, or a protected target).
+#                      wildcards, --all/--mirror, tags via --tags or an explicit
+#                      refs/tags/… refspec, or a protected target).
 #   protected        — ask before a push whose target is main/master; otherwise
 #                      defer. Never auto-approves a push.
 #   off              — don't guard pushes at all.
@@ -656,36 +667,44 @@ def is_benign_segment(tokens):
 
 
 def ref_to_branch(ref, current):
-    """Map one side of a push refspec to (branch_name_or_None, is_wildcard).
-    `HEAD` -> current branch; `refs/heads/x` -> `x`; an empty side (deletion
-    source) or a non-branch ref (`refs/tags/...`) -> None; a `*` glob sets the
-    wildcard flag. A bare name is assumed to be a branch (best-effort: it could
-    be a tag, but that only ever errs toward asking, never toward allowing)."""
+    """Map one side of a push refspec to (branch_name_or_None, is_wildcard,
+    non_branch_ref_or_None). `HEAD` -> current branch; `refs/heads/x` -> `x`; an
+    empty side (a deletion's source) -> all None; a `*` glob sets the wildcard
+    flag. A bare name is assumed to be a branch (best-effort: it could be a tag,
+    but that only ever errs toward asking, never toward allowing).
+
+    A fully-qualified ref that ISN'T a branch (`refs/tags/v1`, `refs/notes/…`)
+    comes back as the third element rather than as a plain None. It names a real
+    ref the push would publish, so the caller has to object to it — read as
+    "no branch here" it would sail past every branch check into the strict
+    auto-approve, which is how `git push origin refs/tags/v1.3.0` used to be
+    allowed while the equivalent `git push origin v1.3.0` asked."""
     if ref == '':
-        return (None, False)
+        return (None, False, None)
     if '*' in ref:
-        return (None, True)
+        return (None, True, None)
     if ref == 'HEAD':
-        return (current, False)
+        return (current, False, None)
     if ref.startswith('refs/heads/'):
-        return (ref[len('refs/heads/'):], False)
+        return (ref[len('refs/heads/'):], False, None)
     if ref.startswith('refs/'):
-        return (None, False)
-    return (ref, False)
+        return (None, False, ref)
+    return (ref, False, None)
 
 
 def parse_refspec(spec, current, delete):
-    """Resolve a refspec to (src_branch, dst_branch, is_wildcard). With
-    `--delete`, the token is a destination ref to remove (src is None)."""
+    """Resolve a refspec to (src_branch, dst_branch, is_wildcard,
+    non_branch_ref). With `--delete`, the token is a destination ref to remove
+    (src is None)."""
     if delete:
-        dst_b, glob = ref_to_branch(spec, current)
-        return (None, dst_b, glob)
+        dst_b, glob, other = ref_to_branch(spec, current)
+        return (None, dst_b, glob, other)
     if spec.startswith('+'):
         spec = spec[1:]
     src_raw, dst_raw = spec.split(':', 1) if ':' in spec else (spec, spec)
-    src_b, src_glob = ref_to_branch(src_raw, current)
-    dst_b, dst_glob = ref_to_branch(dst_raw, current)
-    return (src_b, dst_b, src_glob or dst_glob)
+    src_b, src_glob, src_other = ref_to_branch(src_raw, current)
+    dst_b, dst_glob, dst_other = ref_to_branch(dst_raw, current)
+    return (src_b, dst_b, src_glob or dst_glob, dst_other or src_other)
 
 
 def push_decision(args, current, policy):
@@ -694,7 +713,7 @@ def push_decision(args, current, policy):
     (defer). strict auto-approves a push of the worktree branch (incl. force);
     protected only asks on a protected target. Leans toward asking (strict) /
     deferring (protected) on parsing uncertainty, never toward allowing."""
-    positionals, many, delete, i = [], False, False, 0
+    positionals, many, tags, delete, i = [], False, False, False, 0
     while i < len(args):
         t = args[i]
         if t == '--':
@@ -703,6 +722,8 @@ def push_decision(args, current, policy):
         if t.startswith('-'):
             if t in PUSH_MANY_FLAGS:
                 many = True
+            if t in PUSH_TAG_FLAGS:
+                tags = True
             if t in ('--delete', '-d'):
                 delete = True
             i += 2 if t in PUSH_VALUE_OPTS else 1
@@ -711,7 +732,10 @@ def push_decision(args, current, policy):
         i += 1
 
     if many:
-        return ('ask', "Push targets multiple branches (--all/--mirror) — confirm before proceeding.")
+        return ('ask', "Push targets multiple branches (--all/--mirror)")
+    if tags and policy == 'strict':
+        return ('ask', "Push publishes every local tag (--tags), not just the "
+                       f"worktree branch '{current}'")
 
     # positionals[0] is the repository; the rest are refspecs. With no refspec,
     # git pushes the current branch to its same-named upstream. Force flags
@@ -719,20 +743,21 @@ def push_decision(args, current, policy):
     # so a force push of the worktree branch is treated like any other.
     refspecs = positionals[1:] if positionals else []
     pairs = ([parse_refspec(s, current, delete) for s in refspecs]
-             if refspecs else [(current, current, False)])
+             if refspecs else [(current, current, False, None)])
 
-    for src_b, dst_b, glob in pairs:
+    for src_b, dst_b, glob, other in pairs:
         if glob:
-            return ('ask', "Push uses a wildcard refspec (multiple branches) — confirm before proceeding.")
+            return ('ask', "Push uses a wildcard refspec (multiple branches)")
         if dst_b and is_protected(dst_b):
-            return ('ask', f"Push targets protected branch '{dst_b}' — confirm before proceeding.")
+            return ('ask', f"Push targets protected branch '{dst_b}'")
         if policy == 'strict':
+            if other is not None:
+                return ('ask', f"Push targets '{other}', a tag or other non-branch ref "
+                               f"rather than the worktree branch '{current}'")
             if dst_b is not None and dst_b != current:
-                return ('ask', f"Push targets '{dst_b}', not the worktree branch "
-                                f"'{current}' — confirm before proceeding.")
+                return ('ask', f"Push targets '{dst_b}', not the worktree branch '{current}'")
             if src_b is not None and src_b != current:
-                return ('ask', f"Push sends local branch '{src_b}', not the worktree "
-                                f"branch '{current}' — confirm before proceeding.")
+                return ('ask', f"Push sends local branch '{src_b}', not the worktree branch '{current}'")
 
     if policy == 'strict':
         return ('allow', f"Push of worktree branch '{current}' — auto-approved.")
@@ -752,7 +777,7 @@ def _feature(branch, reason=None):
     if branch is None:
         return ('defer', None)
     if is_protected(branch):
-        return ('ask', reason or f"Targets protected branch '{branch}' — confirm before proceeding.")
+        return ('ask', reason or f"Targets protected branch '{branch}'")
     return ('allow', None)
 
 
@@ -792,10 +817,10 @@ def classify_git(sub, args, branch, policy):
         worktree = '--worktree' in flags or 'W' in short
         if staged and not worktree:
             return ('allow', None)
-        return ('ask', "`git restore` discards working-tree changes — confirm before proceeding.")
+        return ('ask', "`git restore` discards working-tree changes")
     if sub == 'switch':
         if 'f' in short or flags & {'--force', '--discard-changes'}:
-            return ('ask', "`git switch` would discard changes — confirm before proceeding.")
+            return ('ask', "`git switch` would discard changes")
         return ('allow', None)            # create (-c) or plain switch; git refuses if unsafe
     if sub == 'checkout':
         if short & {'b', 'B'}:
@@ -803,49 +828,49 @@ def classify_git(sub, args, branch, policy):
         return ('defer', None)            # ambiguous (branch vs path discard) -> normal flow
     if sub == 'branch':
         if short & {'d', 'D', 'm', 'M', 'f'} or flags & {'--delete', '--move', '--force'}:
-            return ('ask', "Deleting/renaming a git branch — confirm before proceeding.")
+            return ('ask', "Deleting/renaming a git branch")
         return ('allow', None)            # list or create
     if sub == 'tag':
         if 'd' in short or '--delete' in flags:
-            return ('ask', "Deleting a git tag — confirm before proceeding.")
+            return ('ask', "Deleting a git tag")
         return ('allow', None)            # list or create
     if sub == 'worktree':
         if first in ('add', 'list', 'lock', 'unlock'):
             return ('allow', None)
         if first in ('remove', 'prune', 'move'):
-            return ('ask', "Removing/moving a git worktree — confirm before proceeding.")
+            return ('ask', "Removing/moving a git worktree")
         return ('defer', None)
     if sub == 'stash':
         if first in ('list', 'show'):
             return ('allow', None)
         if first in ('drop', 'clear'):
-            return ('ask', "Dropping stashed changes — confirm before proceeding.")
-        return _feature(branch, "Stash operation on a protected branch — confirm before proceeding.")
+            return ('ask', "Dropping stashed changes")
+        return _feature(branch, "Stash operation on a protected branch")
     if sub in ('merge', 'cherry-pick', 'revert', 'am'):
         if flags & {'--abort', '--continue', '--skip', '--quit'}:
             return ('allow', None)        # control ops are safe
-        return _feature(branch, f"`git {sub}` onto a protected branch — confirm before proceeding.")
+        return _feature(branch, f"`git {sub}` onto a protected branch")
     if sub == 'rebase':
         if flags & {'--abort', '--continue', '--skip', '--quit', '--edit-todo'}:
             return ('allow', None)
-        return _feature(branch, "`git rebase` on a protected branch — confirm before proceeding.")
+        return _feature(branch, "`git rebase` on a protected branch")
     if sub == 'pull':
         if '--ff-only' in flags:
             return ('allow', None)
-        return ('ask', "`git pull` may merge or rebase — use --ff-only or confirm.")
+        return ('ask', "`git pull` may merge or rebase (use --ff-only to skip this check)")
     if sub == 'reset':
         if flags & {'--hard', '--merge', '--keep'}:
-            return ('ask', "`git reset --hard` discards changes — confirm before proceeding.")
+            return ('ask', "`git reset --hard` discards changes")
         return ('defer', None)            # soft/mixed -> normal flow
     if sub == 'clean':
         # clean is a no-op without --force; -f is what makes it delete.
         if 'f' in short or '--force' in flags:
-            return ('ask', "`git clean` deletes untracked files — confirm before proceeding.")
+            return ('ask', "`git clean` deletes untracked files")
         return ('defer', None)
     if sub == 'config':
         if flags & {'--global', '--system', '--add', '--unset', '--unset-all',
                     '--replace-all', '--remove-section', '--rename-section', '-e', '--edit'}:
-            return ('ask', "Writing git config — confirm before proceeding.")
+            return ('ask', "Writing git config")
         if flags & {'--get', '--get-all', '--get-regexp', '--get-urlmatch', '--list', '-l'}:
             return ('allow', None)
         return ('defer', None)            # ambiguous `git config key [value]`
@@ -857,10 +882,10 @@ def classify_git(sub, args, branch, policy):
         if first in ('', 'show'):
             return ('allow', None)
         if first in ('expire', 'delete'):
-            return ('ask', "Rewriting the reflog — confirm before proceeding.")
+            return ('ask', "Rewriting the reflog")
         return ('defer', None)
     if sub in ('filter-branch', 'gc'):
-        return ('ask', f"`git {sub}` can rewrite or prune history — confirm before proceeding.")
+        return ('ask', f"`git {sub}` can rewrite or prune history")
 
     return ('defer', None)                # unknown subcommand -> normal flow
 
@@ -916,13 +941,13 @@ def classify_gh_api(args):
     # (`DELETE /user/following/x`, …) still defer.
     if method.upper() == 'DELETE':
         if any('git/refs/' in a for a in args):
-            return ('ask', "`gh api` deletes a git ref (branch/tag) — confirm before proceeding.")
+            return ('ask', "`gh api` deletes a git ref (branch/tag)")
         if any('labels/' in a for a in args):
-            return ('ask', "`gh api` deletes a label — confirm before proceeding.")
+            return ('ask', "`gh api` deletes a label")
         endpoint = positionals[0] if positionals else ''
         segs = [s for s in endpoint.split('/') if s]
         if len(segs) == 3 and segs[0] == 'repos':
-            return ('ask', "`gh api` deletes a repository — confirm before proceeding.")
+            return ('ask', "`gh api` deletes a repository")
     return ('defer', None)
 
 
@@ -938,12 +963,12 @@ def classify_gh(sub, args):
     # effect — destructive, so ask (mirrors `git branch -D` / `git push --delete`).
     if sub == 'pr' and subsub in ('merge', 'close') and (
             '--delete-branch' in args or 'd' in short_flag_letters(args)):
-        return ('ask', "`gh pr {} --delete-branch` deletes the branch — confirm before proceeding.".format(subsub))
+        return ('ask', "`gh pr {} --delete-branch` deletes the branch".format(subsub))
     # `gh repo delete`, `gh release delete`, `gh workflow disable`, … remove or
     # disable a resource — destructive.
     action = DESTRUCTIVE_GH.get((sub, subsub))
     if action is not None:
-        return ('ask', "`gh {} {}` {} — confirm before proceeding.".format(sub, subsub, action))
+        return ('ask', "`gh {} {}` {}".format(sub, subsub, action))
     if (sub, subsub) in READONLY_GH or (sub, '') in READONLY_GH:
         return ('allow', None)
     return ('defer', None)
@@ -1002,8 +1027,23 @@ def emit(decision, reason):
 
 def confirm(reason, mode):
     """Emit `ask`, or `deny` when running in a non-interactive permission mode
-    where no human is present to answer the prompt (fail safe)."""
-    emit('deny' if mode in NON_INTERACTIVE_MODES else 'ask', reason)
+    where no human is present to answer the prompt (fail safe).
+
+    `reason` carries only the cause ("Push targets 'v1.3.0', not the worktree
+    branch 'x'"); the closing clause is added here so each path says what is
+    actually on offer. The `ask` path invites a confirmation. The `deny` path
+    says plainly that there is none — a denial worded "confirm before
+    proceeding" reads as a prompt waiting to be answered, so an agent retries a
+    command that cannot succeed in this session until it gives up. Name the
+    mode, and give the routes that do work."""
+    if mode in NON_INTERACTIVE_MODES:
+        emit('deny', f"{reason} — branch-guard denied it: permission mode "
+                     f"'{mode}' has no way to prompt for confirmation. Retrying "
+                     f"won't help — either do it outside this session (e.g. run "
+                     f"the command in a terminal), or re-run in an interactive "
+                     f"permission mode.")
+        return
+    emit('ask', f"{reason} — confirm before proceeding.")
 
 
 def main():
@@ -1100,7 +1140,7 @@ def main():
         if branch is None:
             return
         if is_protected(branch):
-            confirm(f"Targets protected branch '{branch}' — confirm before proceeding.", mode)
+            confirm(f"Targets protected branch '{branch}'", mode)
         return
 
     # Any other tool -> defer.
