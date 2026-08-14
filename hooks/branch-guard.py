@@ -8,8 +8,19 @@ For Bash `git`/`gh` commands it emits a per-command decision:
   allow  — safe to auto-approve (read-only git/gh, staging, branch creation,
            fetch, a commit/push of a feature/worktree branch, …);
   ask    — confirm first (commit/edit/push to a protected branch, or a
-           destructive command like `reset --hard`, `clean -f`, `branch -D`);
+           destructive command like `reset --hard`, `clean -f`);
   (none) — defer: emit nothing, so the normal permission flow applies.
+
+`git branch` is classified by what the session OWNS rather than by how
+destructive the verb looks (`classify_branch`). A target is in bounds when it is
+recoverable — its tip is reachable from a remote-tracking ref or a local
+integration branch (RECOVERY_REF_PATTERNS), so the worst case is a
+`git reset --hard <sha>` — and private, meaning not in the protected set. This
+only ever relaxes a would-be `ask` into an `allow`, and only on proof from a
+local git query: a foreign repo (`git -C`), an unreachable git, or a branch that
+won't resolve all keep asking. The non-force spellings need no query, because
+git already enforces the same check (`-d` refuses unmerged work; `-m`/`-c`
+refuse an existing destination), so only `-D`/`-M`/`-C`/`-f` are probed.
 
 A command is auto-approved only when EVERY segment in it is recognized-safe — a
 git/gh invocation classified `allow`, a read-only pager piped after one
@@ -30,7 +41,11 @@ An unquoted-delimiter body that the shell would expand (a command substitution
 in it runs) is kept in the stream so the substitution guard still defers.
 
 Also guards file edits (Edit/Write/MultiEdit/NotebookEdit) against the branch of
-the file's own repository, and `git push` according to BRANCH_GUARD_PUSH_POLICY.
+the file's own repository — except for a gitignored path, which holds no branch
+contents to protect (`path_is_ignored`) — and `git push` according to
+BRANCH_GUARD_PUSH_POLICY.
+The protected set is `main`/`master` plus any glob patterns in
+BRANCH_GUARD_PROTECTED_BRANCHES (see `protected_patterns`).
 
 Reads the hook JSON on stdin, emits a PreToolUse decision on stdout. On any
 parsing uncertainty (unbalanced quotes, empty input, unresolvable branch,
@@ -49,9 +64,22 @@ Scope note: branch-guard reasons about git/branch *semantics*. The filesystem
 boundary (commands touching paths outside the workspace) is workspace-guard's
 job; the two don't overlap.
 """
-import sys, os, json, re, shlex, subprocess
+import sys, os, json, re, shlex, subprocess, fnmatch
 
-PROTECTED_BRANCH_RE = re.compile(r'^(main|master)$')
+# Branch names protected no matter what the environment says. Configuration only
+# ever ADDS to this set (see `protected_patterns`), so a typo — or an empty or
+# nonsense BRANCH_GUARD_PROTECTED_BRANCHES — can't quietly drop protection from
+# the two branches that most need it.
+DEFAULT_PROTECTED_BRANCHES = ('main', 'master')
+
+# Extra protected branches, as a comma-separated list of shell globs
+# (`release/*,integration,v?.x`). Read at runtime like BRANCH_GUARD_PUSH_POLICY,
+# so it can be set from settings.json rather than by editing this file — an edit
+# here lives in the plugin cache and is reverted by the next plugin update.
+# Globs rather than regexes: a glob is how people already write branch patterns,
+# and `fnmatch` can't raise on a malformed one the way `re.compile` can. Note
+# `*` spans `/`, so `release/*` covers `release/2.0/rc` too.
+PROTECTED_BRANCHES_ENV = 'BRANCH_GUARD_PROTECTED_BRANCHES'
 
 # POSIX command-prefix assignment (`FOO=bar git commit`): NAME then `=`.
 # Bash treats leading assignments as inline env exports; they don't change
@@ -95,6 +123,20 @@ GH_VALUE_OPTS = {'-R', '--repo'}
 # inline config (`git -c core.pager='!sh -c …' log`). Their presence blocks
 # auto-allow (the command defers) but never suppresses an `ask`.
 GIT_ESCAPE_HATCHES = {'-c', '--config-env'}
+
+# git global options that point the command at a DIFFERENT repository than the
+# session's. The ref probes below run against the session cwd, so their answers
+# would be about the wrong repo — their presence disables probing and the gated
+# `git branch` forms keep their unprobed `ask`.
+REPO_REDIRECT_OPTS = ('-C', '--git-dir', '--work-tree')
+
+# Refs whose reachability makes a branch tip RECOVERABLE: any remote-tracking
+# branch, or a local integration branch. If one of these contains the tip, the
+# commits survive the branch being deleted or force-moved and the worst case is
+# a `git reset --hard <sha>` — so the operation is in bounds for the session
+# that owns the ref. A pattern matching nothing is silently ignored by
+# for-each-ref, so listing `master` in a `main`-only repo is harmless.
+RECOVERY_REF_PATTERNS = ('refs/remotes', 'refs/heads/main', 'refs/heads/master')
 
 # Read-only git subcommands — auto-allowed on any branch.
 READONLY_GIT = frozenset({
@@ -791,7 +833,184 @@ def short_flag_letters(args):
     return letters
 
 
-def classify_git(sub, args, branch, policy):
+def overwrite_verdict(cwd, name, what, probe):
+    """Verdict for a `git branch` form that would overwrite branch <name>'s
+    current tip. Creating a ref that doesn't exist yet loses nothing; moving one
+    whose tip survives on a remote-tracking ref or main costs a
+    `git reset --hard <sha>`. Everything else — including every case the probes
+    can't answer — keeps the `ask`."""
+    if not probe:
+        return ('ask', f"{what} can move an existing branch pointer, and a "
+                       f"`git -C`/`--git-dir` option points at another "
+                       f"repository, so branch-guard can't check what "
+                       f"'{name}' currently points at")
+    exists = branch_exists(cwd, name)
+    if exists is False:
+        return ('allow', None)        # creates a new ref — nothing to overwrite
+    if exists is None:
+        return ('ask', f"{what} can move an existing branch pointer, and "
+                       f"branch-guard couldn't resolve '{name}'")
+    rec = tip_is_recoverable(cwd, name)
+    if rec is True:
+        return ('allow', None)
+    if rec is False:
+        return ('ask', f"{what} moves existing branch '{name}', whose current "
+                       f"tip isn't reachable from any remote-tracking branch "
+                       f"or main")
+    return ('ask', f"{what} moves existing branch '{name}', and branch-guard "
+                   f"couldn't check whether its current tip survives elsewhere")
+
+
+def protected_targets(delete, move, copy, force, pos, current):
+    """Every ref a `git branch` form would remove, rename, or overwrite, each
+    paired with the phrase describing what happens to it. Returned as one list
+    so a SINGLE protected check can cover every form.
+
+    Shared and recoverable are independent questions, and git only enforces the
+    second — it has no notion of which branches you treat as shared. While each
+    verb branch made the protected check for itself, three of them made it
+    before their allow-return and one made it after, which is how
+    `git branch -d main` came to auto-approve. Answering it here, once, ahead
+    of the dispatch is what makes that ordering unrepresentable rather than
+    merely correct today.
+
+    A plain create (`git branch new start`) overwrites nothing, so it has no
+    targets."""
+    if delete:
+        return [(b, f"Deleting protected branch '{b}'") for b in pos]
+    if move or copy:
+        # `-m <new>` renames the current branch; `-m <old> <new>` names both.
+        # A copy leaves its source alone, so only a rename can strand one.
+        dst = pos[-1] if pos else None
+        src = pos[0] if len(pos) > 1 else (None if copy else current)
+        targets = []
+        if move and src is not None:
+            targets.append((src, f"Renaming protected branch '{src}'"))
+        if dst is not None:
+            verb = 'Copying' if copy else 'Renaming'
+            targets.append((dst, f"{verb} a branch onto protected branch '{dst}'"))
+        return targets
+    if force and pos:
+        # `git branch -f <name> [<start>]`: creates <name>, or force-moves it.
+        return [(pos[0], f"`git branch -f` moves protected branch '{pos[0]}'")]
+    return []
+
+
+def classify_branch(flags, short, pos, current, cwd, probe):
+    """Verdict for `git branch`, scoped to what the session owns rather than to
+    the verb. A target is in bounds when it is *recoverable* — its tip survives
+    on a remote-tracking ref or main, so the worst case is a
+    `git reset --hard <sha>` — and *private*, meaning not in the protected set.
+    A protected branch is shared, so it always asks.
+
+    This can only ever relax a would-be `ask` into an `allow`, and only on
+    proof: every form the probes can't answer for keeps asking, so an
+    unreachable git, a foreign repo, or a branch that doesn't exist all land on
+    today's behavior rather than a new approval.
+
+    The non-force spellings need no probe at all, because git already enforces
+    the check the guard would duplicate: `-d` refuses to delete unmerged work,
+    and `-m`/`-c` refuse to clobber an existing destination. Only the force
+    spellings can lose commits. `-D`, `-M`, and `-C` are the force forms of
+    `--delete`, `--move`, and `--copy`, and `-d --force` is `-D` spelled long —
+    so force is read from the whole flag set, never from one letter.
+
+    *Shared* and *recoverable* are independent questions, and git only ever
+    enforces the second. The shared one is therefore answered once for all
+    forms, up front, via `protected_targets` — not inside each verb branch,
+    where an early allow-return could sit above it and answer "not shared" by
+    omission. That is what made `git branch -d main` auto-approve, and hoisting
+    the check is what stops the next verb from repeating it."""
+    force = 'f' in short or '--force' in flags or bool(short & {'D', 'M', 'C'})
+    delete = bool(short & {'d', 'D'}) or '--delete' in flags
+    move = bool(short & {'m', 'M'}) or '--move' in flags
+    copy = bool(short & {'c', 'C'}) or '--copy' in flags
+
+    # Shared, once, for every form — before any verb branch can return `allow`.
+    # `-d` can't orphan commits, but it still drops the local ref, so a
+    # protected target asks whether or not git would permit the delete.
+    for name, reason in protected_targets(delete, move, copy, force, pos, current):
+        if is_protected(name):
+            return ('ask', reason)
+
+    # Recoverable, per form. Everything below may assume no target is shared.
+    if delete:
+        if not force:
+            return ('allow', None)    # git itself refuses to drop unmerged work
+        if not pos:
+            return ('ask', "`git branch --delete --force` names no branch")
+        if not probe:
+            return ('ask', "`git branch -D` force-deletes a branch, and a "
+                           "`git -C`/`--git-dir` option points at another "
+                           "repository, so branch-guard can't check whether "
+                           "the commits survive elsewhere")
+        # `-r` deletes a remote-tracking ref (`git branch -rD origin/x`). Such a
+        # target sits under refs/remotes, so it satisfies the reachability check
+        # by containing itself — which is the right answer for the right reason:
+        # the ref is a local cache of the remote and `git fetch` restores it.
+        for b in pos:
+            rec = tip_is_recoverable(cwd, b)
+            if rec is True:
+                continue
+            if rec is False:
+                return ('ask', f"`git branch -D` force-deletes '{b}', whose "
+                               f"tip isn't reachable from any remote-tracking "
+                               f"branch or main")
+            return ('ask', f"`git branch -D` force-deletes '{b}', and "
+                           f"branch-guard couldn't check whether its commits "
+                           f"survive elsewhere")
+        return ('allow', None)
+
+    if move or copy:
+        dst = pos[-1] if pos else None
+        if dst is None:
+            return ('ask', "`git branch --move`/`--copy` names no branch")
+        if not force:
+            return ('allow', None)    # git itself refuses an existing dest
+        return overwrite_verdict(cwd, dst, '`git branch -M`' if move
+                                 else '`git branch -C`', probe)
+
+    if force:
+        if not pos:
+            return ('ask', "`git branch --force` names no branch")
+        return overwrite_verdict(cwd, pos[0], '`git branch -f`', probe)
+
+    return ('allow', None)            # list or create
+
+
+def classify_reset(branch, cwd, probe):
+    """Verdict for `git reset --hard` (and the `--merge`/`--keep` forms).
+
+    The command does two things, and only one of them is a ref operation: it
+    moves the current branch pointer, and it discards uncommitted changes to
+    tracked files. Uncommitted work is reachable from no ref, so nothing can
+    prove it recoverable — which is why a dirty worktree always asks, and why
+    the ownership model can't simply be applied to this verb the way it is to
+    `git branch`.
+
+    With a clean worktree there is nothing to discard, so the command reduces
+    to the pointer move and the same two questions apply: an unprotected branch
+    whose tip survives on a remote-tracking ref or main costs a
+    `git reset --hard <sha>` to put back. Shared is answered first, as
+    everywhere else. Every probe that can't answer keeps the `ask`."""
+    if branch is None:
+        return ('ask', "`git reset --hard` discards changes")
+    if is_protected(branch):
+        return ('ask', f"`git reset --hard` on protected branch '{branch}'")
+    if not probe:
+        return ('ask', "`git reset --hard` discards changes, and a "
+                       "`git -C`/`--git-dir` option points at another "
+                       "repository, so branch-guard can't check that one")
+    if worktree_is_clean(cwd) is not True:
+        return ('ask', "`git reset --hard` discards uncommitted changes to "
+                       "tracked files")
+    if tip_is_recoverable(cwd, branch) is not True:
+        return ('ask', f"`git reset --hard` moves branch '{branch}', whose tip "
+                       f"isn't reachable from any remote-tracking branch or main")
+    return ('allow', None)
+
+
+def classify_git(sub, args, branch, policy, cwd, probe):
     """Verdict ('allow' | 'ask' | 'defer', reason) for a `git <sub>` command."""
     flags = {a for a in args if a.startswith('-')}
     short = short_flag_letters(args)
@@ -827,9 +1046,7 @@ def classify_git(sub, args, branch, policy):
             return ('allow', None)        # unambiguous branch create
         return ('defer', None)            # ambiguous (branch vs path discard) -> normal flow
     if sub == 'branch':
-        if short & {'d', 'D', 'm', 'M', 'f'} or flags & {'--delete', '--move', '--force'}:
-            return ('ask', "Deleting/renaming a git branch")
-        return ('allow', None)            # list or create
+        return classify_branch(flags, short, pos, branch, cwd, probe)
     if sub == 'tag':
         if 'd' in short or '--delete' in flags:
             return ('ask', "Deleting a git tag")
@@ -841,11 +1058,18 @@ def classify_git(sub, args, branch, policy):
             return ('ask', "Removing/moving a git worktree")
         return ('defer', None)
     if sub == 'stash':
-        if first in ('list', 'show'):
-            return ('allow', None)
         if first in ('drop', 'clear'):
             return ('ask', "Dropping stashed changes")
-        return _feature(branch, "Stash operation on a protected branch")
+        # Stashing adds no commit and rewrites no history — it moves worktree
+        # changes into `refs/stash` — so the protected branch a session happens
+        # to be on is the wrong question to ask about it. On the other axis it's
+        # recoverable by construction: keeping the changes retrievable is the
+        # entire point, which is why only `drop`/`clear` (the forms that discard
+        # a stash) are gated. Listed explicitly rather than allowed by default,
+        # so a future subcommand defers instead of inheriting an allow.
+        if first in ('', 'push', 'save', 'list', 'show', 'apply', 'pop'):
+            return ('allow', None)
+        return ('defer', None)
     if sub in ('merge', 'cherry-pick', 'revert', 'am'):
         if flags & {'--abort', '--continue', '--skip', '--quit'}:
             return ('allow', None)        # control ops are safe
@@ -856,11 +1080,17 @@ def classify_git(sub, args, branch, policy):
         return _feature(branch, "`git rebase` on a protected branch")
     if sub == 'pull':
         if '--ff-only' in flags:
-            return ('allow', None)
-        return ('ask', "`git pull` may merge or rebase (use --ff-only to skip this check)")
+            return ('allow', None)        # advances the branch; adds no local work
+        # `pull` is `fetch` plus `merge`-or-`rebase`, and all three of those are
+        # allowed on a non-protected branch — so gating the composite there made
+        # it stricter than every one of its parts, for a branch nobody else
+        # depends on. On a protected branch it lands a merge (or rewrites
+        # history) and asks, like `merge`/`rebase` do.
+        return _feature(branch, f"`git pull` may merge or rebase onto protected "
+                                f"branch '{branch}'")
     if sub == 'reset':
         if flags & {'--hard', '--merge', '--keep'}:
-            return ('ask', "`git reset --hard` discards changes")
+            return classify_reset(branch, cwd, probe)
         return ('defer', None)            # soft/mixed -> normal flow
     if sub == 'clean':
         # clean is a no-op without --force; -f is what makes it delete.
@@ -974,7 +1204,16 @@ def classify_gh(sub, args):
     return ('defer', None)
 
 
-def classify_segment(inv, branch, policy):
+def targets_other_repo(globals_):
+    """True if a git invocation's global options point it at a repository other
+    than the session's (`-C path`, `--git-dir=…`, `--work-tree=…`, in attached
+    or separate-token form). The ref probes run against the session cwd, so
+    their answers wouldn't be about the repo the command acts on."""
+    return any(g == o or g.startswith(o + '=')
+               for g in globals_ for o in REPO_REDIRECT_OPTS)
+
+
+def classify_segment(inv, branch, policy, cwd):
     """Verdict ('nongit' | 'allow' | 'ask' | 'defer', reason) for one segment.
     'nongit' marks a segment that isn't a git/gh invocation (so the whole
     command can't be auto-approved)."""
@@ -984,12 +1223,26 @@ def classify_segment(inv, branch, policy):
         return classify_gh(inv['sub'] or '', inv['args'])
     if inv['sub'] is None:
         return ('defer', None)            # bare `git`
-    verdict, reason = classify_git(inv['sub'], inv['args'], branch, policy)
+    verdict, reason = classify_git(inv['sub'], inv['args'], branch, policy,
+                                   cwd, not targets_other_repo(inv['globals']))
     # An inline-config escape hatch blocks auto-allow, but must not weaken a
     # protective `ask` (e.g. `git -c k=v commit` on main still asks).
     if verdict == 'allow' and (set(inv['globals']) & GIT_ESCAPE_HATCHES):
         return ('defer', None)
     return (verdict, reason)
+
+
+def run_git(cwd, *args):
+    """Run `git -C <cwd> <args>` and return the CompletedProcess, or None when
+    git can't be run at all (missing binary, timeout). The 5s cap keeps a wedged
+    repo or stuck git from blocking the hook until Claude Code's 10s hook
+    timeout fires, degrading every tool call — a None answer makes every caller
+    fail safe."""
+    try:
+        return subprocess.run(['git', '-C', cwd] + list(args),
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def current_branch(cwd):
@@ -998,23 +1251,122 @@ def current_branch(cwd):
     git hangs. Unlike `rev-parse --abbrev-ref HEAD` (which prints the literal
     "HEAD" and exits 0 on a detached HEAD), `symbolic-ref -q` exits non-zero
     when HEAD is detached, so a detached HEAD resolves to None and the hook
-    defers. The 5s timeout keeps a wedged repo or stuck git from blocking the
-    hook until Claude Code's 10s hook timeout fires, degrading every tool call —
-    on timeout we defer (fail safe) like any other unresolvable branch."""
-    try:
-        r = subprocess.run(
-            ['git', '-C', cwd, 'symbolic-ref', '--short', '-q', 'HEAD'],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if r.returncode != 0:
+    defers (fail safe) like any other unresolvable branch."""
+    r = run_git(cwd, 'symbolic-ref', '--short', '-q', 'HEAD')
+    if r is None or r.returncode != 0:
         return None
     return r.stdout.strip() or None
 
 
+def branch_exists(cwd, name):
+    """True/False if local branch <name> does/doesn't exist; None when the query
+    can't answer (git unavailable, not a repo, malformed ref name). Callers must
+    treat None as "unknown" and keep asking — never as "safe to overwrite"."""
+    r = run_git(cwd, 'show-ref', '--verify', '--quiet', 'refs/heads/' + name)
+    if r is None:
+        return None
+    if r.returncode == 0:
+        return True
+    if r.returncode == 1:
+        return False
+    return None                       # 128: malformed ref name, or not a repo
+
+
+def worktree_is_clean(cwd):
+    """True if no TRACKED file is modified or staged; False if some are; None
+    when the query can't answer.
+
+    `-uno` omits untracked files on purpose. `git reset` never deletes them
+    (measured on git 2.55: an untracked file and an ignored one both survive
+    `reset --hard`), so they are not at risk, and counting a stray scratch file
+    as dirty would prompt for something the command cannot destroy."""
+    r = run_git(cwd, 'status', '--porcelain', '-uno')
+    if r is None or r.returncode != 0:
+        return None
+    return not r.stdout.strip()
+
+
+def tip_is_recoverable(cwd, name):
+    """True if branch <name>'s tip is reachable from one of
+    RECOVERY_REF_PATTERNS, so deleting or force-moving the branch orphans
+    nothing. False when provably not reachable; None when the query can't answer
+    — a branch that doesn't exist makes `--contains` fail (exit 129), which is
+    "unknown", not "recoverable"."""
+    r = run_git(cwd, 'for-each-ref', '--contains', name,
+                '--format=%(refname)', *RECOVERY_REF_PATTERNS)
+    if r is None or r.returncode != 0:
+        return None
+    return bool(r.stdout.strip())
+
+
+def nearest_existing_dir(path):
+    """The closest ancestor of <path> that exists on disk, or <path> itself.
+
+    An edit names where the file WILL be, which need not exist yet — agents
+    create files in new directories constantly. `git -C` on a missing directory
+    fails before it ever looks for a repo, so the branch probe read "no repo"
+    from what is really "no directory" and the edit deferred with no prompt.
+    The branch is knowable from any existing ancestor, because a repo covers its
+    whole subtree — including the directory about to be created in it.
+
+    Climbing stops at the filesystem root, which is not a repo, so a path under
+    no repo still resolves to no branch and defers exactly as before. When an
+    ancestor IS a repo the walk finds it, and that is the right answer for the
+    right reason: the new file lands inside that repo's worktree.
+    """
+    while path and not os.path.isdir(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    return path
+
+
+def path_is_ignored(repo_dir, path):
+    """True if the file <path> writes to is gitignored, so an edit to it can't
+    change what the branch contains. False on every other answer — including
+    every answer the probe can't give (git unavailable, not a repo, a path
+    outside the worktree, pathspec magic git refuses) — so uncertainty keeps the
+    protected-branch ask.
+
+    Probes the REALPATH, not the path as given: a symlink inside an ignored
+    directory is itself ignored, but the write lands on its target, so probing
+    the link would exempt an edit to a tracked file. Resolving also fails in the
+    safe direction — a link out of the worktree reports not-ignored and keeps
+    the ask — and it normalizes `..` on the way.
+
+    `git check-ignore` consults the INDEX by default: a tracked file that also
+    matches an ignore rule (someone `git add -f`'d it) reports NOT ignored, so
+    it keeps prompting — measured on git 2.55, and the reason `--no-index` must
+    never be added here. That flag reports the file as ignored purely on the
+    pattern, which would drop the guard on a file whose edits do land on the
+    branch.
+    """
+    r = run_git(repo_dir, 'check-ignore', '-q', '--', os.path.realpath(path))
+    return r is not None and r.returncode == 0
+
+
+def protected_patterns():
+    """The protected-branch glob patterns: the built-in defaults plus each
+    non-empty comma-separated entry of BRANCH_GUARD_PROTECTED_BRANCHES.
+
+    Extend-only by design. There is no way to configure the defaults away, so
+    bad input can only ever protect MORE than intended, never less — an unset,
+    empty, or all-whitespace value leaves exactly today's `main`/`master` set,
+    and a garbled pattern just fails to match anything. That makes the
+    fail-safe structural rather than something the parser has to get right."""
+    extra = os.environ.get(PROTECTED_BRANCHES_ENV) or ''
+    return list(DEFAULT_PROTECTED_BRANCHES) + [
+        p for p in (e.strip() for e in extra.split(',')) if p
+    ]
+
+
 def is_protected(branch):
-    return bool(PROTECTED_BRANCH_RE.match(branch))
+    """True if `branch` matches a protected pattern. Case-sensitive
+    (`fnmatchcase`), matching git's own branch-name semantics and keeping the
+    result identical on every platform — plain `fnmatch` folds case on Windows
+    only, so the same config would protect a different set there."""
+    return any(fnmatch.fnmatchcase(branch, p) for p in protected_patterns())
 
 
 def emit(decision, reason):
@@ -1076,7 +1428,8 @@ def main():
             return                                 # no git/gh command -> defer
 
         policy = push_policy()
-        branch = current_branch(data.get('cwd') or os.getcwd())
+        cwd = data.get('cwd') or os.getcwd()
+        branch = current_branch(cwd)
         verdicts = []
         for (seg, writes), inv in zip(segments, invs):
             if inv is None:
@@ -1096,7 +1449,7 @@ def main():
                 else:
                     verdicts.append(('nongit', None))
             else:
-                verdict, reason = classify_segment(inv, branch, policy)
+                verdict, reason = classify_segment(inv, branch, policy, cwd)
                 # An output redirect to a file is a write side-effect the
                 # classifier can't see (`git log --format=… > f` writes
                 # possibly-attacker-influenced content). Downgrade a would-be
@@ -1136,10 +1489,20 @@ def main():
         # would land in the wrong repo and resolve the wrong branch.
         cwd = data.get('cwd') or os.getcwd()
         abs_path = file_path if os.path.isabs(file_path) else os.path.join(cwd, file_path)
-        branch = current_branch(os.path.dirname(abs_path) or cwd)
+        # The file's directory need not exist yet (a write into a new dir), and
+        # `git -C` fails on a missing one before looking for a repo — so ask the
+        # nearest existing ancestor, which is in the same repo (or in none).
+        repo_dir = nearest_existing_dir(os.path.dirname(abs_path) or cwd)
+        branch = current_branch(repo_dir)
         if branch is None:
             return
         if is_protected(branch):
+            # A gitignored path holds no branch contents, so the decision would
+            # be the same on `main` as on a feature branch and the prompt
+            # carries no signal. Probed only here, where the answer can change
+            # the outcome — a feature-branch edit still costs no subprocess.
+            if path_is_ignored(repo_dir, abs_path):
+                return
             confirm(f"Targets protected branch '{branch}'", mode)
         return
 

@@ -59,6 +59,12 @@ nat() {
 # only this run's dir — no blanket `rm -rf tmp` that would nuke a sibling run.
 mkdir -p "$REPO_ROOT/tmp"
 WORK="$(mktemp -d "$REPO_ROOT/tmp/test-repo.XXXXXX")"
+# One fixture (5f) needs a directory that is inside NO repo, which nothing under
+# tmp/ can be — this checkout is itself a repo. The platform temp dir is the
+# only such place the suite can reach, so it lives outside tmp/ deliberately;
+# the case that uses it asserts the not-a-repo precondition rather than assuming
+# it.
+OUTSIDE="$(mktemp -d "${TMPDIR:-/tmp}/branch-guard-outside.XXXXXX")"
 
 # Keep tests hermetic regardless of the caller's shell.
 unset BRANCH_GUARD_PUSH_POLICY
@@ -67,7 +73,7 @@ pass=0
 fail=0
 
 cleanup() {
-  rm -rf "$WORK"
+  rm -rf "$WORK" ${OUTSIDE:+"$OUTSIDE"}
 }
 trap cleanup EXIT INT TERM
 
@@ -78,16 +84,26 @@ setup_repo() {
   git -C "$WORK" config user.name "Test"
   git -C "$WORK" config user.email "test@example.com"
   printf 'hello\n' > "$WORK/file.txt"
+  # A gitignored scratch dir, plus a file that matches an ignore rule yet is
+  # tracked anyway (`add -f`) — the case that separates "ignored" from "has no
+  # branch contents". See section 5d.
+  printf 'tmp/\nforced.txt\n' > "$WORK/.gitignore"
+  mkdir -p "$WORK/tmp"
+  printf 'tracked anyway\n' > "$WORK/forced.txt"
   git -C "$WORK" add -A
+  git -C "$WORK" add -f forced.txt
   git -C "$WORK" commit -q -m "init"
   git -C "$WORK" branch claude/x
 }
 
-# decision_for PAYLOAD CWD [ENV_KV] -> echoes the permissionDecision, or "none".
-# ENV_KV is an optional `NAME=value` passed into the hook's environment.
+# decision_for PAYLOAD CWD [NAME=value ...] -> echoes the permissionDecision, or
+# "none". Trailing args go into the hook's environment. They are passed to `env`
+# quoted (`"$@"`), so a value may contain a glob (`release/*`) without the shell
+# expanding it against the working directory.
 decision_for() {
-  local payload="$1" cwd="$2" env_kv="${3:-}" out
-  out="$( cd "$cwd" && printf '%s' "$payload" | env ${env_kv} "$LAUNCHER" "$HOOK_SCRIPT" )"
+  local payload="$1" cwd="$2" out
+  shift 2
+  out="$( cd "$cwd" && printf '%s' "$payload" | env "$@" "$LAUNCHER" "$HOOK_SCRIPT" )"
   if [[ -z "$out" ]]; then
     printf 'none'
   else
@@ -95,10 +111,12 @@ decision_for() {
   fi
 }
 
-# reason_for PAYLOAD CWD [ENV_KV] -> echoes the permissionDecisionReason, or "".
+# reason_for PAYLOAD CWD [NAME=value ...] -> echoes the permissionDecisionReason,
+# or "".
 reason_for() {
-  local payload="$1" cwd="$2" env_kv="${3:-}" out
-  out="$( cd "$cwd" && printf '%s' "$payload" | env ${env_kv} "$LAUNCHER" "$HOOK_SCRIPT" )"
+  local payload="$1" cwd="$2" out
+  shift 2
+  out="$( cd "$cwd" && printf '%s' "$payload" | env "$@" "$LAUNCHER" "$HOOK_SCRIPT" )"
   if [[ -n "$out" ]]; then
     printf '%s' "$out" | jq -r '.hookSpecificOutput.permissionDecisionReason'
   fi
@@ -155,6 +173,18 @@ launcher_err="$(printf '' | "$LAUNCHER" definitely-not-a-real-script.py 2>&1)" \
   && launcher_rc=0 || launcher_rc=$?
 check "launcher rejects a missing script -> exit 1" 1 "$launcher_rc"
 check_text "launcher says why it failed" has "script not found" "$launcher_err"
+
+#    The launcher-coverage claim, asserted directly. Every fixture reaches the
+#    hook through `decision_for`/`reason_for`, and both invoke "$LAUNCHER" --
+#    but that is a convention, and a convention is what a new fixture breaks.
+#    A case count never checked this: a fixture running the interpreter itself
+#    would increment the count, pass, and quietly leave the launcher covered by
+#    one case instead of all of them. So check the property, not a proxy for it.
+bypasses="$(grep -nE '(^|[^-A-Za-z_])(python3?)([^-A-Za-z_]|$).*branch-guard\.py' \
+  "$SCRIPT_DIR/run.sh" || true)"
+check "no fixture invokes the hook outside the launcher" "" "$bypasses"
+check "both hook helpers go through the launcher" 2 \
+  "$(grep -c '"\$LAUNCHER" "\$HOOK_SCRIPT"' "$SCRIPT_DIR/run.sh")"
 
 #    Which half of the polyglot answered is itself a coverage claim, so pin it.
 #    Git Bash hands a .cmd to the Windows command processor, so the batch branch
@@ -243,7 +273,83 @@ check "edit rel path honors payload cwd (worktree on claude/x) -> none" none \
 check "edit rel path honors payload cwd (main checkout) -> ask" ask \
   "$(decision_for "$(edit_payload Edit file_path file.txt "$WORK")" "$REPO_ROOT")"
 git -C "$WORK" worktree remove -f "$WT"
+
+# 5d. A gitignored path holds no branch contents, so editing one on a protected
+#     branch is the same operation it would be on a feature branch — no prompt.
+#     The tracked-but-ignored file is the security half of this: `git add -f`
+#     puts it in the index, its edits DO land on the branch, and `check-ignore`
+#     reports it as not-ignored precisely because it consults the index. That
+#     is what makes one probe sufficient, so pin it — a `--no-index` here would
+#     read the pattern alone and silently drop the guard on a tracked file.
+git -C "$WORK" checkout -q main
+check "edit gitignored path on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/scratch.json")" "$REPO_ROOT")"
+check "edit tracked-but-ignored path on main -> ask" ask \
+  "$(decision_for "$(edit_payload Edit file_path "$WORK/forced.txt")" "$REPO_ROOT")"
+#     The ignored path is also reached via a relative file_path + payload cwd,
+#     so the skip resolves the same path the branch check does.
+check "edit gitignored rel path on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path tmp/scratch.json "$WORK")" "$REPO_ROOT")"
+#     And it is a skip, not a blanket exemption: a non-ignored sibling in the
+#     same directory still asks.
+check "edit non-ignored path on main -> ask" ask \
+  "$(decision_for "$(edit_payload Edit file_path "$WORK/file.txt")" "$REPO_ROOT")"
+#     The skip must not fire where no human could answer it either way — an
+#     ignored path defers rather than denying under a non-interactive mode.
+check "[auto] edit gitignored path on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/scratch.json" "" auto)" "$REPO_ROOT")"
+
+# 5e. The probe must answer about the file the write LANDS on. A symlink inside
+#     an ignored dir is itself ignored, but its target need not be — so probing
+#     the link as given exempted an edit that really did change branch contents.
+#     Git Bash's `ln -s` copies the file unless Windows permits a real link, so
+#     assert against what the fixture actually is rather than the platform: with
+#     a copy there is no target to follow and the ignored-dir exemption holds.
+printf 'scratch\n' > "$WORK/tmp/scratch.json"
+ln -s ../file.txt "$WORK/tmp/to-tracked.txt" 2>/dev/null || true
+ln -s ./scratch.json "$WORK/tmp/to-ignored.json" 2>/dev/null || true
+if [[ -L "$WORK/tmp/to-tracked.txt" ]]; then
+  check "edit symlink in ignored dir -> tracked file on main -> ask" ask \
+    "$(decision_for "$(edit_payload Edit file_path "$WORK/tmp/to-tracked.txt")" "$REPO_ROOT")"
+else
+  check "edit copy in ignored dir (no symlink support) on main -> none" none \
+    "$(decision_for "$(edit_payload Edit file_path "$WORK/tmp/to-tracked.txt")" "$REPO_ROOT")"
+fi
+#     A link to a genuinely ignored file stays exempt, so the feature survives —
+#     and a copy of one is ignored too, which is why this expectation doesn't
+#     move with symlink support.
+check "edit symlink in ignored dir -> ignored file on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/to-ignored.json")" "$REPO_ROOT")"
+
+# 5f. An edit names where the file WILL be, and that directory need not exist —
+#     agents create files in new directories constantly. `git -C` fails on a
+#     missing directory before it ever looks for a repo, so the branch read as
+#     unresolvable and the write went unguarded on `main`, silently. The two
+#     axes cross here: the branch (protected vs feature) and whether the
+#     not-yet-existing path is ignored, since neither alone pins the outcome.
+check "edit new file in a new dir on main -> ask" ask \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/newdir/f.py")" "$REPO_ROOT")"
+check "edit new file in deeply nested new dirs on main -> ask" ask \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/a/b/c/f.py")" "$REPO_ROOT")"
+#     The #58 gitignored skip still applies once the branch resolves: a new dir
+#     under an ignored one holds no branch contents either.
+check "edit new file in a new dir under a gitignored dir on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/newdir/f.py")" "$REPO_ROOT")"
+#     Walking up only ever reaches an ancestor of the file, so a path in no repo
+#     still resolves to no branch — the fail-safe half. Assert the precondition
+#     rather than trusting it: if the system temp dir were itself inside a repo,
+#     the case below would pass for the wrong reason.
+outside_is_repo=no
+git -C "$OUTSIDE" rev-parse --is-inside-work-tree >/dev/null 2>&1 && outside_is_repo=yes
+check "system temp dir sits in no repo (precondition)" no "$outside_is_repo"
+check "edit new file in a new dir outside any repo -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$OUTSIDE/newdir/f.py")" "$REPO_ROOT")"
+
 git -C "$WORK" checkout -q claude/x
+#     And the feature-branch control: the walk resolves a branch there too, it
+#     just isn't one worth prompting about.
+check "edit new file in a new dir on claude/x -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/newdir/f.py")" "$REPO_ROOT")"
 
 # 6. unknown tool / missing file_path -> no decision
 check "unknown tool -> none" none \
@@ -418,14 +524,63 @@ check "git checkout <ambiguous> -> none (defer)" none \
   "$(decision_for "$(bash_cmd 'git checkout file.txt')" "$WORK")"
 
 # 14. Destructive git commands ask (and deny when unattended).
-check "git reset --hard -> ask" ask \
+#     `git reset --hard` does two things and only one is a ref operation: it
+#     moves the branch pointer, and it discards uncommitted changes to tracked
+#     files. Uncommitted work is in no ref, so a dirty worktree always asks; a
+#     clean one reduces the command to the pointer move, where the same
+#     shared/recoverable pair applies. Crossed both ways, per the rule above.
+printf 'dirty\n' >> "$WORK/file.txt"
+check "git reset --hard, dirty worktree -> ask" ask \
   "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
+check "[auto] git reset --hard, dirty worktree -> deny" deny \
+  "$(decision_for "$(push_mode 'git reset --hard' 'auto')" "$WORK")"
+git -C "$WORK" checkout -q -- file.txt
+check "git reset --hard, clean worktree on a recoverable branch -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
+#     `reset` never deletes untracked or ignored files, so an untracked file
+#     must not read as dirty -- that is what `--porcelain -uno` buys, and
+#     without it this prompts for something the command cannot destroy.
+printf 'scratch\n' > "$WORK/untracked-scratch.txt"
+check "git reset --hard, only an untracked file present -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
+rm -f "$WORK/untracked-scratch.txt"
+#     Shared first, as everywhere else.
+git -C "$WORK" checkout -q main
+check "git reset --hard on protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
+git -C "$WORK" checkout -q claude/x
+#     A tip nothing else reaches keeps the ask even with a clean worktree.
+git -C "$WORK" checkout -q -b reset-orphan
+git -C "$WORK" commit -q --allow-empty -m "unreachable from anything"
+check "git reset --hard on an irrecoverable tip -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
+git -C "$WORK" checkout -q claude/x
+#     The probes read the session repo, so a foreign one keeps the ask.
+check "git -C other-repo reset --hard -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git -C /somewhere/else reset --hard')" "$WORK")"
 check "git reset --soft -> none (defer)" none \
   "$(decision_for "$(bash_cmd 'git reset --soft HEAD~1')" "$WORK")"
 check "git clean -fd -> ask" ask \
   "$(decision_for "$(bash_cmd 'git clean -fd')" "$WORK")"
 check "git branch -D -> ask" ask \
   "$(decision_for "$(bash_cmd 'git branch -D old')" "$WORK")"
+# A non-force rename can't lose commits -- git refuses to clobber an existing
+# destination itself -- so it is auto-approved rather than prompted.
+check "git branch -m rename -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -m old new')" "$WORK")"
+# `-f` neither deletes nor renames: it creates, or force-moves an existing
+# pointer. Creating a name nothing holds loses nothing, so it allows.
+check "git branch -f creating a free name -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -f backup old')" "$WORK")"
+branch_D_reason="$(reason_for "$(bash_cmd 'git branch -D old')" "$WORK")"
+check_text "git branch -D reason names the delete" has \
+  'force-deletes' "$branch_D_reason"
+check_text "git branch -D reason does not claim a rename" lacks \
+  'Deleting/renaming' "$branch_D_reason"
+# `-D` is `--delete --force` spelled long; the delete reason must win.
+check_text "git branch -d --force reason names the delete" has \
+  'force-deletes' \
+  "$(reason_for "$(bash_cmd 'git branch -d --force old')" "$WORK")"
 check "git restore (worktree) -> ask" ask \
   "$(decision_for "$(bash_cmd 'git restore file.txt')" "$WORK")"
 check "git worktree remove -> ask" ask \
@@ -434,10 +589,29 @@ check "git config --global -> ask" ask \
   "$(decision_for "$(bash_cmd 'git config --global user.name x')" "$WORK")"
 check "git stash drop -> ask" ask \
   "$(decision_for "$(bash_cmd 'git stash drop')" "$WORK")"
+#     Stashing adds no commit and rewrites no history, so the branch a session
+#     sits on is the wrong question for it -- and it is recoverable by
+#     construction, which is the whole point. Only the forms that discard a
+#     stash are gated. Nothing crossed stash against a protected branch before,
+#     which is how the wrong axis went unnoticed.
+check "git stash -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git stash')" "$WORK")"
+check "git stash pop -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git stash pop')" "$WORK")"
+check "git stash branch (unlisted form) -> none (defer)" none \
+  "$(decision_for "$(bash_cmd 'git stash branch recovered')" "$WORK")"
+git -C "$WORK" checkout -q main
+check "git stash on main -> allow (touches no branch history)" allow \
+  "$(decision_for "$(bash_cmd 'git stash')" "$WORK")"
+check "git stash pop on main -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git stash pop')" "$WORK")"
+check "git stash drop on main -> ask (still discards a stash)" ask \
+  "$(decision_for "$(bash_cmd 'git stash drop')" "$WORK")"
+git -C "$WORK" checkout -q claude/x
 check "readonly + destructive chain -> ask" ask \
-  "$(decision_for "$(bash_cmd 'git status && git reset --hard')" "$WORK")"
-check "[auto] git reset --hard -> deny" deny \
-  "$(decision_for "$(push_mode 'git reset --hard' 'auto')" "$WORK")"
+  "$(decision_for "$(bash_cmd 'git status && git clean -fd')" "$WORK")"
+check "[auto] git clean -fd -> deny" deny \
+  "$(decision_for "$(push_mode 'git clean -fd' 'auto')" "$WORK")"
 
 # 15. Branch-sensitive mutations: feature -> allow, protected -> ask.
 check "git rebase on feature -> allow" allow \
@@ -448,13 +622,28 @@ check "git rebase --abort -> allow" allow \
   "$(decision_for "$(bash_cmd 'git rebase --abort')" "$WORK")"
 check "git pull --ff-only -> allow" allow \
   "$(decision_for "$(bash_cmd 'git pull --ff-only')" "$WORK")"
-check "git pull (non-ff) -> ask" ask \
+#     `pull` is `fetch` + `merge`-or-`rebase`, all three of which allow on a
+#     feature branch, so gating the composite there was stricter than any of
+#     its parts. Crossed against the protected branch below.
+check "git pull (non-ff) on a feature branch -> allow" allow \
   "$(decision_for "$(bash_cmd 'git pull')" "$WORK")"
+check "git pull --rebase on a feature branch -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git pull --rebase')" "$WORK")"
 git -C "$WORK" checkout -q main
 check "git rebase on main -> ask" ask \
   "$(decision_for "$(bash_cmd 'git rebase origin/main')" "$WORK")"
 check "git merge on main -> ask" ask \
   "$(decision_for "$(bash_cmd 'git merge feature-y')" "$WORK")"
+check "git pull (non-ff) on main -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git pull')" "$WORK")"
+check "git pull --rebase on main -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git pull --rebase')" "$WORK")"
+check_text "git pull on main names the branch" has \
+  "protected branch 'main'" "$(reason_for "$(bash_cmd 'git pull')" "$WORK")"
+#     A fast-forward adds no local work to the branch, so it stays allowed even
+#     on a protected one -- it only advances main to what the remote already has.
+check "git pull --ff-only on main -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git pull --ff-only')" "$WORK")"
 git -C "$WORK" checkout -q claude/x
 
 # 16. Inline-config escape hatch blocks auto-allow but not a protective ask.
@@ -678,8 +867,8 @@ check "git log &>/dev/null -> allow" allow \
 # A redirect doesn't weaken a protective ask.
 check "git push origin main 2>&1 -> ask" ask \
   "$(decision_for "$(bash_cmd 'git push origin main 2>&1')" "$WORK")"
-check "git reset --hard 2>&1 -> ask" ask \
-  "$(decision_for "$(bash_cmd 'git reset --hard 2>&1')" "$WORK")"
+check "git clean -fd 2>&1 -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git clean -fd 2>&1')" "$WORK")"
 
 # ---------------------------------------------------------------------------
 # 21. Redirect-write awareness (hardening). An output redirect to a real FILE is
@@ -701,8 +890,8 @@ check "git log >/dev/null -> allow" allow \
 check "git log >/dev/stdout -> allow" allow \
   "$(decision_for "$(bash_cmd 'git log >/dev/stdout')" "$WORK")"
 # A file-writing redirect must NOT weaken a protective ask.
-check "git reset --hard > out -> ask (write doesn't weaken ask)" ask \
-  "$(decision_for "$(bash_cmd 'git reset --hard > out.txt')" "$WORK")"
+check "git clean -fd > out -> ask (write doesn't weaken ask)" ask \
+  "$(decision_for "$(bash_cmd 'git clean -fd > out.txt')" "$WORK")"
 # A bare redirect with no command writes a file -> it blocks the chain.
 check "> out ; git status -> none (bare write blocks)" none \
   "$(decision_for "$(bash_cmd '> out.txt ; git status')" "$WORK")"
@@ -742,8 +931,8 @@ check 'git status ; echo $(rm) -> none (subst)' none \
 check "git status && echo done && rm -rf foo -> none" none \
   "$(decision_for "$(bash_cmd 'git status && echo done && rm -rf foo')" "$WORK")"
 # A benign segment must NOT weaken a protective ask.
-check "git reset --hard ; echo done -> ask" ask \
-  "$(decision_for "$(bash_cmd 'git reset --hard ; echo done')" "$WORK")"
+check "git clean -fd ; echo done -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git clean -fd ; echo done')" "$WORK")"
 
 # ---------------------------------------------------------------------------
 # 23. Heredoc bodies are treated as opaque data, not command segments. A body
@@ -789,26 +978,232 @@ check "commit + heredoc on main -> ask" ask \
   "$(decision_for "$(bash_payload "$(printf 'git commit -F- <<'"'"'EOF'"'"'\nmsg\nEOF')")" "$WORK")"
 git -C "$WORK" checkout -q claude/x
 
+# 24. `git branch` scoped to what the session owns, not to the verb. A target is
+#     in bounds when it is recoverable (tip reachable from a remote-tracking ref
+#     or main) and private (not protected). The probes can only ever relax a
+#     would-be `ask` into an `allow`, so every case they can't answer for --
+#     a branch that doesn't exist, a foreign repo -- keeps asking.
+#
+#     Fixture branches: `merged` sits at main's tip (recoverable via
+#     refs/heads/main); `orphan` carries a commit reachable from nothing else.
+git -C "$WORK" branch merged
+git -C "$WORK" checkout -q -b orphan
+git -C "$WORK" commit -q --allow-empty -m "unreachable work"
+git -C "$WORK" checkout -q claude/x
+
+#     `pushed` carries a commit main can't reach, recoverable only because a
+#     remote-tracking ref holds it — the case the whole model turns on, and the
+#     one a repo with no remote would otherwise never exercise.
+git -C "$WORK" checkout -q -b pushed
+git -C "$WORK" commit -q --allow-empty -m "work that survives on the remote"
+git -C "$WORK" update-ref refs/remotes/origin/pushed \
+  "$(git -C "$WORK" rev-parse pushed)"
+git -C "$WORK" checkout -q claude/x
+
+#     Non-force spellings need no probe: git enforces the same check itself.
+check "git branch -d (git refuses unmerged) -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -d merged')" "$WORK")"
+check "git branch -d on an unmerged branch -> allow (git refuses it)" allow \
+  "$(decision_for "$(bash_cmd 'git branch -d orphan')" "$WORK")"
+
+#     Shared and recoverable are INDEPENDENT questions, and git only enforces
+#     the second one. `-d` can't orphan commits, but it still drops the local
+#     ref, so a protected target asks either way. This crossing -- a non-force
+#     spelling against a protected branch -- is the gap that let `git branch -d
+#     main` auto-approve: every protected assertion used a force spelling, and
+#     every non-force case named an unprotected branch.
+check "git branch -d protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -d main')" "$WORK")"
+check "git branch --delete protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch --delete main')" "$WORK")"
+#     Same for a branch protected only by configuration -- otherwise the
+#     BRANCH_GUARD_PROTECTED_BRANCHES set is bypassable by lowercasing a flag.
+#     The unset control is what makes the pair mean anything: without it the
+#     `ask` below could come from anywhere, and a `-d` that asked unconditionally
+#     would pass too.
+check "[unset] git branch -d release/1.2 -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -d release/1.2')" "$WORK")"
+check "[configured] git branch -d release/1.2 -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -d release/1.2')" "$WORK" \
+     'BRANCH_GUARD_PROTECTED_BRANCHES=release/*')"
+#     The same crossing on every remaining verb. `-d`/`-D`/`-m`/`-f` had it;
+#     `-M`, `-c`, and `-C` did not, so three of the seven forms that can name a
+#     protected target were asserted nowhere. One shared check covers them all
+#     now, and these pin that it does -- a per-verb check is what let the
+#     orderings drift apart in the first place.
+check "git branch -m onto protected (non-force) -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -m merged main')" "$WORK")"
+check "git branch -M onto protected (force move) -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -M merged main')" "$WORK")"
+check "git branch -c onto protected (copy) -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -c merged main')" "$WORK")"
+check "git branch -C onto protected (force copy) -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -C merged main')" "$WORK")"
+check "git branch -m rename -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -m orphan renamed')" "$WORK")"
+check "git branch -c copy -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -c orphan copy')" "$WORK")"
+
+#     Force delete: recoverable target allows, orphaning target asks.
+check "git branch -D recoverable -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -D merged')" "$WORK")"
+check "git branch -D irrecoverable -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D orphan')" "$WORK")"
+check "git branch -D of several, one irrecoverable -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D merged orphan')" "$WORK")"
+check "git branch -D protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D main')" "$WORK")"
+#     Unreachable from main, but the remote still has it.
+check "git branch -D recoverable via remote-tracking ref -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -D pushed')" "$WORK")"
+#     `-r` deletes the local cache of a remote ref; a fetch restores it.
+check "git branch -rD remote-tracking ref -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -rD origin/pushed')" "$WORK")"
+#     `-d --force` is `-D` spelled long, so force must be read from the whole
+#     flag set -- reading only the letter `d` would auto-approve a real delete.
+check "git branch -d --force irrecoverable -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -d --force orphan')" "$WORK")"
+check "git branch --delete --force recoverable -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch --delete --force merged')" "$WORK")"
+
+#     Force move/copy: creating a new ref loses nothing; moving an existing one
+#     depends on whether its CURRENT tip survives elsewhere.
+check "git branch -f creating a backup ref -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -f backup claude/x')" "$WORK")"
+check "git branch -f onto a recoverable branch -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -f merged main')" "$WORK")"
+check "git branch -f onto an irrecoverable branch -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -f orphan main')" "$WORK")"
+check "git branch -f protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -f main claude/x')" "$WORK")"
+check "git branch -M onto a new name -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -M merged brand-new')" "$WORK")"
+check "git branch -M onto an irrecoverable branch -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -M merged orphan')" "$WORK")"
+check "git branch -m from protected -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -m main renamed')" "$WORK")"
+check "git branch -C onto an irrecoverable branch -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -C merged orphan')" "$WORK")"
+
+#     Unprovable cases keep today's `ask`: a branch that doesn't exist can't be
+#     shown recoverable, and a `-C` global points the command at another repo
+#     than the one the probes read.
+check "git branch -D nonexistent -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D no-such-branch')" "$WORK")"
+check "git -C other-repo branch -D -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git -C /somewhere/else branch -D merged')" "$WORK")"
+
+#     Listing is untouched, and the unattended fail-safe still applies.
+check "git branch --list -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -a -v')" "$WORK")"
+check "[auto] git branch -D irrecoverable -> deny" deny \
+  "$(decision_for "$(push_mode 'git branch -D orphan' 'auto')" "$WORK")"
+
+#     Wording: the reason has to say what is actually happening. `git branch -f`
+#     creating a ref was reported as "Deleting/renaming a git branch", which is
+#     the opposite of the truth and invites approving for the wrong reason.
+branch_reason="$(reason_for "$(bash_cmd 'git branch -f orphan main')" "$WORK")"
+check_text "branch -f reason names the move, not a delete" has \
+  "moves existing branch 'orphan'" "$branch_reason"
+check_text "branch -f reason drops the old delete/rename wording" lacks \
+  "Deleting/renaming" "$branch_reason"
+check_text "branch -f ask still invites a confirmation" has \
+  "confirm before proceeding" "$branch_reason"
+del_reason="$(reason_for "$(bash_cmd 'git branch -D orphan')" "$WORK")"
+check_text "branch -D reason says why it isn't recoverable" has \
+  "isn't reachable from any remote-tracking branch or main" "$del_reason"
+
+# 25. The protected set is configurable at runtime via
+#     BRANCH_GUARD_PROTECTED_BRANCHES (comma-separated globs), the same way the
+#     push policy is. It EXTENDS main/master rather than replacing them, so no
+#     value — however garbled — can unprotect the defaults.
+git -C "$WORK" branch release/1.2
+git -C "$WORK" branch release/2.0/rc
+git -C "$WORK" branch integration
+BR='BRANCH_GUARD_PROTECTED_BRANCHES=release/*,integration'
+
+# Unset, a release branch is an ordinary feature branch: this is the behavior
+# that used to need an edit to the hook file to change.
+git -C "$WORK" checkout -q release/1.2
+check "[unset] commit on release/1.2 -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK")"
+check "[configured] commit on release/1.2 -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+check_text "[configured] reason names the configured branch" has \
+  "Targets protected branch 'release/1.2'" \
+  "$(reason_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+# fnmatch's `*` spans `/`, so one `release/*` entry covers nested release refs.
+git -C "$WORK" checkout -q release/2.0/rc
+check "[configured] commit on release/2.0/rc -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+# A glob-free entry protects exactly that branch, and matching is
+# case-sensitive (fnmatchcase), like git's own branch names.
+git -C "$WORK" checkout -q integration
+check "[configured] commit on integration -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+check "[configured] pattern 'Integration' doesn't match 'integration' -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" \
+     'BRANCH_GUARD_PROTECTED_BRANCHES=Integration')"
+# Extend-only: the defaults survive a config that never mentions them, and a
+# branch matching no pattern is unaffected.
+git -C "$WORK" checkout -q main
+check "[configured] commit on main still -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+git -C "$WORK" checkout -q claude/x
+check "[configured] commit on claude/x -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" "$BR")"
+# Garbled input (empty and whitespace-only entries) fails safe to the defaults
+# rather than protecting nothing.
+git -C "$WORK" checkout -q main
+check "[garbled] commit on main still -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" \
+     'BRANCH_GUARD_PROTECTED_BRANCHES=  , ,')"
+git -C "$WORK" checkout -q claude/x
+check "[garbled] commit on claude/x -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git commit -m x')" "$WORK" \
+     'BRANCH_GUARD_PROTECTED_BRANCHES=  , ,')"
+# The edit path and the push guard's protected-target check read the same set.
+git -C "$WORK" checkout -q release/1.2
+check "[configured] edit of a file on release/1.2 -> ask" ask \
+  "$(decision_for "$(edit_payload Edit file_path "$WORK/file.txt")" "$WORK" "$BR")"
+git -C "$WORK" checkout -q claude/x
+check "[protected] push origin release/1.2 -> none (unset)" none \
+  "$(decision_for "$(push 'git push origin release/1.2')" "$WORK" "$PROT")"
+check "[protected+configured] push origin release/1.2 -> ask" ask \
+  "$(decision_for "$(push 'git push origin release/1.2')" "$WORK" "$PROT" "$BR")"
+# And a configured ask still becomes a deny where no human can answer.
+check "[protected+configured][auto] push origin integration -> deny" deny \
+  "$(decision_for "$(push_mode 'git push origin integration' 'auto')" "$WORK" "$PROT" "$BR")"
+
+# `git branch`'s ownership tier (section 24) calls a target in bounds only when
+# it is recoverable AND private, and reads "private" from `is_protected` — so
+# configuring a branch withdraws that auto-approve too. release/1.2 sits at
+# main's tip, so it stays recoverable throughout and only privacy moves.
+check "[unset] branch -D release/1.2 -> allow (recoverable and private)" allow \
+  "$(decision_for "$(bash_cmd 'git branch -D release/1.2')" "$WORK")"
+check "[configured] branch -D release/1.2 -> ask (no longer private)" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D release/1.2')" "$WORK" "$BR")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 
-# CLAUDE.md backs its launcher-coverage claim with this suite's case count.
-# That number is prose, so nothing stopped a fixture from landing and leaving
-# it stale -- it had drifted by three before anyone noticed. Assert it here
-# rather than in CI: a case count is only knowable by running the suite, and
-# the suite already runs on every job. This check is not itself a fixture, so
-# it does not perturb the number it is checking.
+# A FLOOR, not an exact count. The suite used to assert its own size against a
+# number written in CLAUDE.md, which had two problems. It raced: the size is a
+# global property but every branch validated it against its own base, so two
+# fixture-adding PRs that each bumped correctly left main wrong by the second
+# one's delta -- which is exactly how main went red at 316-documented-as-310.
+# And it never checked the property it was advertised as defending: a fixture
+# invoking the interpreter directly would increment the count and pass.
+#
+# The floor keeps the one thing the count genuinely caught -- a suite that
+# silently collapses, because setup failed or a section exited early -- while
+# conflicting with nobody. Raise it when the suite grows a lot; nothing breaks
+# if it lags.
+CASE_FLOOR=280
 counts_ok=1
-if [[ -f "$REPO_ROOT/CLAUDE.md" ]]; then
-  documented="$(grep -oE 'covered by all [0-9]+ cases' "$REPO_ROOT/CLAUDE.md" \
-    | grep -oE '[0-9]+' || true)"
-  if [[ -z "$documented" ]]; then
-    printf 'CLAUDE.md no longer states a case count; update it or this check\n' >&2
-    counts_ok=0
-  elif [[ "$documented" -ne $((pass + fail)) ]]; then
-    printf 'CLAUDE.md says %s cases, this run had %d\n' \
-      "$documented" "$((pass + fail))" >&2
-    counts_ok=0
-  fi
+if [[ $((pass + fail)) -lt "$CASE_FLOOR" ]]; then
+  printf 'suite ran %d cases, under the floor of %d — did setup fail, or a section exit early?\n' \
+    "$((pass + fail))" "$CASE_FLOOR" >&2
+  counts_ok=0
 fi
 
 [[ "$fail" -eq 0 && "$counts_ok" -eq 1 ]]

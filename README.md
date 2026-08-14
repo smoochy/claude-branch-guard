@@ -16,8 +16,8 @@ every git command or prompt on every one.
 branch-guard is a `PreToolUse` hook that classifies each `git`/`gh` command,
 **auto-approves the safe ones** (read-only, staging, branch/worktree creation,
 commits and pushes on a feature branch), and **prompts** before anything that
-touches a protected branch (`main`/`master`) or is destructive. Everything else
-defers to your normal permission settings.
+touches a protected branch (`main`/`master`, plus any you add) or is destructive.
+Everything else defers to your normal permission settings.
 
 ## Contents
 
@@ -81,14 +81,25 @@ the default `strict` [push policy](#push-guard).
 | `git commit -F- <<'EOF' … EOF` *(feature branch; heredoc body is opaque data)* | allow |
 | `git fetch 2>/dev/null` / `git log >/dev/null 2>&1` *(discard redirect / fd-dup)* | allow |
 | `git pull --ff-only` | allow |
+| `git pull` / `git pull --rebase` *(feature branch — as `fetch`, `merge`, and `rebase` already are)* | allow |
+| `git branch -d old` / `git branch -m old new` / `git branch -c old copy` *(unprotected target; git refuses the unsafe cases itself)* | allow |
+| `git branch -D old` *(tip survives on a remote-tracking branch or `main`)* | allow |
+| `git branch -f backup claude/x` *(the ref doesn't exist yet — a create)* | allow |
+| `git reset --hard origin/main` *(clean worktree, feature branch whose tip survives elsewhere)* | allow |
+| `git stash` / `git stash pop` *(any branch — adds no commit, rewrites no history, recoverable by design)* | allow |
 | `git commit -m "fix"` *(on `main`)* | **ask** |
 | editing a file whose repo is on `main` *(Edit/Write/MultiEdit/NotebookEdit)* | **ask** |
+| editing a symlink in a gitignored dir that points at a tracked file, on `main` *(the write lands on branch contents)* | **ask** |
+| writing a new file into a directory that doesn't exist yet, on `main` *(`src/newdir/f.py`)* | **ask** |
 | `git push origin main` / `git push origin HEAD:main` | **ask** |
 | `git push origin other-branch` *(strict policy)* | **ask** |
 | `git push origin v1.3.0` / `git push origin refs/tags/v1.3.0` / `git push --tags` *(publishes a tag, strict policy)* | **ask** |
-| `git reset --hard HEAD~1` | **ask** |
+| `git reset --hard HEAD~1` *(uncommitted changes to tracked files, or a tip nothing else reaches, or on `main`)* | **ask** |
 | `git clean -fd` | **ask** |
-| `git branch -D old` | **ask** |
+| `git stash drop` / `git stash clear` *(discards a stash)* | **ask** |
+| `git branch -D old` *(tip reachable from nothing else — the commits would be orphaned)* | **ask** |
+| `git branch -d main` / `git branch -D main` / `git branch -m x main` *(protected branch, any spelling)* | **ask** |
+| `git branch -f old main` / `git branch -M x old` *(moves an existing branch off commits nothing else reaches)* | **ask** |
 | `gh pr merge 5 --delete-branch` / `gh pr close 5 -d` *(deletes the branch)* | **ask** |
 | `gh repo delete owner/repo` / `gh label delete bug` *(deletes a resource)* | **ask** |
 | `gh release delete v1` / `gh release delete-asset v1 file.zip` / `gh secret delete X` / `gh variable delete Y` / `gh gist delete abc` / `gh cache delete 1` *(deletes a resource; `secret`/`variable` also via the `remove` alias)* | **ask** |
@@ -98,8 +109,9 @@ the default `strict` [push policy](#push-guard).
 | `gh api -X DELETE repos/o/r` *(deletes a repository — exact `repos/{o}/{r}` path)* | **ask** |
 | `git restore file.txt` *(discards working changes)* | **ask** |
 | `git config --global user.name x` | **ask** |
-| `git pull` *(may merge or rebase)* | **ask** |
+| `git pull` / `git pull --rebase` *(on `main` — lands a merge, or rewrites history)* | **ask** |
 | `git rebase`/`git merge` *(onto `main`)* | **ask** |
+| editing a **gitignored** path on `main` *(`tmp/scratch.json` — nothing the branch can contain)* | defer |
 | `git status && rm -rf foo` *(non-git segment)* | defer |
 | `git log --format=… > out.txt` *(redirects git output to a real file)* | defer |
 | `git status ; echo x > out.txt` *(benign segment writes a file)* | defer |
@@ -132,6 +144,63 @@ file and keep allowing (`git fetch 2>/dev/null` stays auto-approved).
 switch branches or discard a file's changes — and the hook defers on ambiguity
 rather than guess. Only the unambiguous branch-create form (`git checkout -b`)
 auto-approves.
+
+### `git branch`: what the session owns, not how the verb looks
+
+`git branch` is the one subcommand judged by its **target** rather than by its
+verb. Deleting a scratch ref you created ten minutes ago and deleting a branch
+nobody else can recover are the same command, and gating both prompts constantly
+for the first while adding nothing to the second. So a target is auto-approved
+when it is both:
+
+- **recoverable** — its tip is reachable from a remote-tracking branch or from
+  local `main`/`master`, so the commits survive the branch and the worst case is
+  `git reset --hard <sha>`; and
+- **private** — not in the protected set. A protected branch is shared, so it
+  always asks.
+
+These are independent questions, and the protected one is asked first for every
+spelling. The non-force spellings need no *recoverability* check, because git
+already enforces that one itself: `git branch -d` refuses to delete unmerged
+work, and `git branch -m` and `-c` refuse to overwrite an existing destination.
+Only the force spellings — `-D`, `-M`, `-C`, `-f`, and `-d --force` — can lose
+commits, so only those are checked for recoverability. But git has no notion of
+which branches you consider shared, so `git branch -d main` prompts exactly like
+`git branch -D main`, as does any branch matching
+[`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration). `git branch -f backup claude/x` creating a new ref
+loses nothing and auto-approves; the same command pointed at a ref that already
+exists is judged on what that ref currently points at.
+
+The check runs two local `git` queries and never touches the network. It can
+only ever turn a prompt into an approval, and only on a positive answer — if git
+can't be reached, the branch won't resolve, or a `git -C`/`--git-dir` option
+points the command at a different repository than the one the queries read, the
+command asks exactly as it did before.
+
+One caveat worth knowing: "reachable from a remote-tracking branch" trusts your
+last `git fetch`. A stale `refs/remotes/origin/x` left behind after the branch
+was deleted on the remote still reads as recoverable. Like the rest of the hook
+this is best-effort friction reduction, not a guarantee — see
+[Limitations](#limitations).
+
+`git reset --hard` gets the same test, but only when it has nothing else to
+destroy. The command does two things: it moves the current branch pointer, and
+it throws away uncommitted changes to tracked files. Uncommitted work exists in
+no ref, so nothing can show it's recoverable — which is why a **dirty worktree
+always prompts**. With a clean worktree the command is just the pointer move,
+and the ordinary test applies: an unprotected branch whose tip survives
+elsewhere auto-approves, because putting it back costs one
+`git reset --hard <sha>`.
+
+Untracked and ignored files don't count as dirty, because `reset` never deletes
+them. A stray scratch file in your worktree isn't at risk, so it doesn't earn a
+prompt.
+
+The other destructive commands stay gated by what they are, not what they
+target, because there's nothing for this test to check. `git clean -f` deletes
+untracked files, which exist in no ref by definition, and a dropped stash
+survives only in the reflog. Those prompts aren't friction to be tuned away —
+they're the cases where the work really can vanish.
 
 One narrow relaxation of the all-segments rule covers a constant AI-agent habit:
 piping read-only git/gh output through a pager. A trailing segment also counts as
@@ -214,7 +283,23 @@ edit to a file checked out on `main` (e.g. a parent repo path) even while your
 session's cwd is a feature-branch worktree. A **relative** `file_path` is first
 resolved against the session's `cwd` (from the hook payload), so an edit inside a
 nested worktree resolves to the worktree's branch even when the hook process runs
-from the parent checkout — not falsely against the parent's `main`.
+from the parent checkout — not falsely against the parent's `main`. When the
+file's directory doesn't exist yet (a write into a new directory), the branch is
+read from the nearest existing ancestor, which sits in the same repository; a
+path under no repository still resolves to no branch and defers.
+
+A **gitignored** path is exempt: writing `tmp/scratch.json` on `main` gets no
+prompt, because an ignored file holds no branch contents and the decision would
+be identical on a feature branch. The check is `git check-ignore`, run only when
+the branch is protected — so a feature-branch edit costs nothing extra — and only
+its "yes, ignored" answer withdraws the prompt. Every other answer, including
+every answer it can't give (the path is outside the worktree, the repo won't
+open, git isn't available), leaves the **ask** in place. A file that matches an
+ignore rule but is *tracked* anyway (`git add -f`) still asks: `check-ignore`
+consults the index, and edits to that file really do land on the branch. The
+probe follows symlinks and asks about the file the write lands on, so a link
+inside an ignored directory pointing at a tracked file still asks — a link to a
+genuinely ignored file stays exempt.
 
 ## Push guard
 
@@ -230,6 +315,10 @@ variable:
 A bare `git push` / `git push origin` pushes the current branch to its same-named
 upstream: under `strict` it is auto-approved (it's the worktree branch); under
 `protected` it defers.
+
+Wherever these rows say `main`/`master`, they mean the protected set — which you
+can widen with [`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration), so
+`git push origin release/2.0` asks under `protected` once `release/*` is in it.
 
 **Tags.** Publishing a tag isn't a push of the worktree branch, so under `strict`
 it asks — whichever way it's spelled (`git push origin v1.3.0`,
@@ -490,10 +579,16 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   all run without a prompt on a `claude/*` or feature branch; the same on
   main/master prompts. Use `git switch -c claude/<topic>` (or a worktree) before
   editing or committing.
+- **Scratch files go in a gitignored path.** Writing `tmp/notes.json` (or any
+  path covered by `.gitignore`) never prompts, on any branch — an ignored file
+  holds no branch contents. A file that's tracked despite matching an ignore
+  rule still prompts on main/master.
 - **Push the worktree's own branch.** `git push` / `git push -u origin HEAD`
   auto-approves; pushing a different branch or a refspec like `HEAD:main` prompts.
-- **Prefer fast-forward pulls.** `git pull --ff-only` is auto-approved; a bare
-  `git pull` (which may merge or rebase) prompts.
+- **Prefer fast-forward pulls on a protected branch.** On a feature branch a
+  bare `git pull` is auto-approved. On `main` it prompts, because it lands a
+  merge or rewrites history — `git pull --ff-only` is auto-approved there, since
+  it only advances the branch to what the remote already has.
 - **Chaining git/gh with harmless labels is fine; a real command is not.**
   Read-only labels/no-ops ride along, so `git log … ; echo "---" ; git status`
   and `git log | head` auto-approve — but `git commit && <other-command>` prompts
@@ -522,9 +617,24 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   { "env": { "BRANCH_GUARD_PUSH_POLICY": "protected" } }
   ```
 
-- **Protected branches** — the default set is `main` and `master`, defined by
-  `PROTECTED_BRANCH_RE` at the top of `hooks/branch-guard.py`. Edit the regex to
-  protect additional branches (e.g. `release/*`).
+- **Protected branches** — `main` and `master` are always protected. Protect more
+  by setting `BRANCH_GUARD_PROTECTED_BRANCHES` to a comma-separated list of glob
+  patterns, in the same `settings.json`:
+
+  ```json
+  { "env": { "BRANCH_GUARD_PROTECTED_BRANCHES": "release/*,integration" } }
+  ```
+
+  Each pattern matches a whole branch name, case-sensitively, and `*` spans `/` —
+  so `release/*` covers both `release/2.0` and `release/2.0/rc`. Empty and
+  whitespace-only entries are ignored.
+
+  The list **extends** the defaults rather than replacing them. There is no way
+  to configure `main` or `master` out of the protected set, so a typo (or a
+  value the hook can't make sense of) can only ever protect more than you meant,
+  never less. The setting reaches every place the guard consults a branch:
+  commits and branch-sensitive mutations, the `Edit`/`Write` check, and the push
+  guard's protected-target rule under both `strict` and `protected`.
 
 - **Non-interactive modes** — in `auto`, `dontAsk`, and `bypassPermissions` an
   `ask` is automatically emitted as `deny` so the guard fails safe when no human
@@ -559,6 +669,13 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   classified (it asks/defers rather than allowing). Auto-approval is a
   convenience layer, not a security boundary — for hard guarantees use a git
   `pre-push` hook and/or server-side branch protection.
+- The [`git branch` recoverability check](#git-branch-what-the-session-owns-not-how-the-verb-looks)
+  reads local refs only, so it trusts your last `git fetch`. A remote-tracking
+  ref left stale after the branch was deleted upstream still counts as
+  recoverable, and a branch pushed since the last fetch may not. It also has no
+  notion of a branch being shared beyond the protected set — a branch with an
+  open PR is not treated as shared, though deleting it locally leaves both the
+  remote branch and the PR intact.
 
 ## Companion plugin
 
@@ -592,9 +709,11 @@ Install it the same way as branch-guard:
 ## Privacy
 
 The hook runs entirely on your machine and has no network access, telemetry, or
-analytics. It reads the pending Bash/edit command and resolves the current branch
-with `git symbolic-ref`, decides in memory, and never opens file contents or writes
-anything to disk.
+analytics. It reads the pending Bash/edit command and asks `git` a few read-only
+questions about the repository — the current branch (`symbolic-ref`), whether a
+branch exists and where its commits survive (`show-ref`, `for-each-ref`), and
+whether a path is ignored (`check-ignore`) — then decides in memory. It never
+opens the contents of the file being edited and never writes anything to disk.
 
 ## Contributing
 
