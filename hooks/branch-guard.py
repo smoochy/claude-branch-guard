@@ -1054,8 +1054,19 @@ def classify_git(sub, args, branch, policy, cwd, probe):
     if sub == 'worktree':
         if first in ('add', 'list', 'lock', 'unlock'):
             return ('allow', None)
-        if first in ('remove', 'prune', 'move'):
-            return ('ask', "Removing/moving a git worktree")
+        if first == 'remove':
+            # git enforces this one itself, the same way it does for
+            # `branch -d`: it refuses to remove a worktree containing modified
+            # OR untracked files (measured on git 2.55 — exit 128, "use --force
+            # to delete it"). That is stricter than `reset --hard`, which leaves
+            # untracked files alone, so the non-force form cannot destroy
+            # uncommitted work and needs no probe. Only `--force` can.
+            if 'f' in short or '--force' in flags:
+                return ('ask', "`git worktree remove --force` deletes a worktree "
+                               "holding modified or untracked files")
+            return ('allow', None)
+        if first in ('prune', 'move'):
+            return ('ask', "Pruning or moving a git worktree")
         return ('defer', None)
     if sub == 'stash':
         if first in ('drop', 'clear'):
@@ -1189,11 +1200,21 @@ def classify_gh(sub, args):
         return classify_gh_api(args)
     pos = [a for a in args if not a.startswith('-')]
     subsub = pos[0] if pos else ''
-    # `gh pr merge|close --delete-branch` (`-d`) removes the branch as a side
-    # effect — destructive, so ask (mirrors `git branch -D` / `git push --delete`).
-    if sub == 'pr' and subsub in ('merge', 'close') and (
+    # `gh pr close --delete-branch` (`-d`) deletes a branch whose work was never
+    # merged, so the commits are left reachable from nothing — destructive, ask.
+    #
+    # `gh pr merge --delete-branch` is NOT the same operation and used to be
+    # treated as if it were. The merge lands the work on the base branch before
+    # the delete runs, so the delete adds no risk beyond the merge it
+    # accompanies — and `gh pr merge` on its own defers. Escalating the pair to
+    # `ask` therefore overrode the user's own permission settings for the safer
+    # of the two spellings: whoever allowlisted `gh pr merge` got the bare form
+    # auto-approved and the standard cleanup form prompted. It defers now, so
+    # both spellings answer to the same settings.
+    if sub == 'pr' and subsub == 'close' and (
             '--delete-branch' in args or 'd' in short_flag_letters(args)):
-        return ('ask', "`gh pr {} --delete-branch` deletes the branch".format(subsub))
+        return ('ask', "`gh pr close --delete-branch` deletes a branch whose "
+                       "work was never merged")
     # `gh repo delete`, `gh release delete`, `gh workflow disable`, … remove or
     # disable a resource — destructive.
     action = DESTRUCTIVE_GH.get((sub, subsub))
