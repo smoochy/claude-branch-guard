@@ -23,6 +23,7 @@ Everything else defers to your normal permission settings.
 
 - [What it does](#what-it-does)
 - [Behavior](#behavior)
+- [Break-glass: `BRANCH_GUARD_OVERRIDE`](#break-glass-branch_guard_override)
 - [Push guard](#push-guard)
 - [Install](#install)
 - [Upgrade](#upgrade)
@@ -41,7 +42,7 @@ The hook produces one of three outcomes per command:
 
 - **allow** — the command runs without a prompt.
 - **ask** — Claude Code shows its standard permission prompt. You approve or
-  reject. In a non-interactive mode this becomes **deny** (see
+  reject. In a mode with no prompt to show, this becomes **deny** (see
   [Configuration](#configuration)).
 - **defer** — the hook stays silent; your normal permission settings apply.
 
@@ -75,6 +76,9 @@ the default `strict` [push policy](#push-guard).
 | `git push` / `git push -u origin HEAD` *(worktree branch)* | allow |
 | `git push --force` *(worktree branch)* | allow |
 | `git push --force-with-lease=other origin HEAD:other` *(rewrites an unprotected branch, lease names the destination)* | allow |
+| `git push` *(worktree branch; the base moved, but not into the lines this branch edits)* | allow |
+| `git push --dry-run` / `git push --delete origin claude/x` *(nothing lands on the base, so no overlap to have)* | allow |
+| `git push` *(on `release/1.2` — a release branch is diverged from the base on purpose)* | allow |
 | `gh pr view 123` / `gh pr list` / `gh repo view` / `gh run watch` / `gh search prs` | allow |
 | `gh api repos/o/r` / `gh api -X GET …` *(a read — default or explicit GET)* | allow |
 | `git log \| head` / `gh pr checks 123 \| head -20` / `git diff --stat \| tail -n 5` *(piped to a read-only filter)* | allow |
@@ -86,6 +90,7 @@ the default `strict` [push policy](#push-guard).
 | `git pull` / `git pull --rebase` *(feature branch — as `fetch`, `merge`, and `rebase` already are)* | allow |
 | `git branch -d old` / `git branch -m old new` / `git branch -c old copy` *(unprotected target; git refuses the unsafe cases itself)* | allow |
 | `git branch -D old` *(tip survives on a remote-tracking branch or `main`)* | allow |
+| `git branch -D tmp-basecheck` *(scratch ref whose only unshared commit is a merge git reproduces)* | allow |
 | `git branch -f backup claude/x` *(the ref doesn't exist yet — a create)* | allow |
 | `git reset --hard origin/main` *(clean worktree, feature branch whose tip survives elsewhere)* | allow |
 | `git stash` / `git stash pop` *(any branch — adds no commit, rewrites no history, recoverable by design)* | allow |
@@ -97,10 +102,12 @@ the default `strict` [push policy](#push-guard).
 | `git push origin other-branch` *(strict policy — no lease naming the destination)* | **ask** |
 | `git push --force-with-lease=main origin HEAD:main` / `git push --delete --force-with-lease=other origin other` *(protected target; a deletion)* | **ask** |
 | `git push origin v1.3.0` / `git push origin refs/tags/v1.3.0` / `git push --tags` *(publishes a tag, strict policy)* | **ask** |
+| `git push` *(worktree branch, but the base has moved into the same lines this branch edits)* | **ask** |
 | `git reset --hard HEAD~1` *(uncommitted changes to tracked files, or a tip nothing else reaches, or on `main`)* | **ask** |
 | `git clean -fd` | **ask** |
 | `git stash drop` / `git stash clear` *(discards a stash)* | **ask** |
-| `git branch -D old` *(tip reachable from nothing else — the commits would be orphaned)* | **ask** |
+| `git branch -D old` *(tip reachable from nothing else, and the branch carries commits of its own)* | **ask** |
+| `git branch -D tmp-conflict` *(its merge was resolved by hand, so that tree exists nowhere else)* | **ask** |
 | `git branch -d main` / `git branch -D main` / `git branch -m x main` *(protected branch, any spelling)* | **ask** |
 | `git branch -f old main` / `git branch -M x old` *(moves an existing branch off commits nothing else reaches)* | **ask** |
 | `gh pr close 5 --delete-branch` / `gh pr close 5 -d` *(deletes a branch whose work was never merged)* | **ask** |
@@ -113,6 +120,8 @@ the default `strict` [push policy](#push-guard).
 | `git restore file.txt` *(discards working changes)* | **ask** |
 | `git worktree remove --force ../wt` *(deletes a worktree holding modified or untracked files)* | **ask** |
 | `git config --global user.name x` | **ask** |
+| `BRANCH_GUARD_OVERRIDE=<reason> git restore file.txt` *(break-glass on a local-loss ask — see below)* | allow |
+| `BRANCH_GUARD_OVERRIDE=<reason> git push origin other` / `… gh repo delete o/r` / `… git branch -D main` *(the break-glass reaches none of these)* | **ask** |
 | `git pull` / `git pull --rebase` *(on `main` — lands a merge, or rewrites history)* | **ask** |
 | `git rebase`/`git merge` *(onto `main`)* | **ask** |
 | editing a **gitignored** path on `main` *(`tmp/scratch.json` — nothing the branch can contain)* | defer |
@@ -175,7 +184,30 @@ which branches you consider shared, so `git branch -d main` prompts exactly like
 loses nothing and auto-approves; the same command pointed at a ref that already
 exists is judged on what that ref currently points at.
 
-The check runs two local `git` queries and never touches the network. It can
+A force-delete has one more way to be in bounds, because "the tip survives" and
+"nothing is lost" turn out not to be the same question. Consider a scratch
+branch that merged an integration ref to see what would happen:
+
+```bash
+git switch -c tmp-basecheck
+git merge origin/main       # does the gate still pass over the merged tree?
+git switch -
+git branch -D tmp-basecheck
+```
+
+Its tip is unreachable *because* it merged — the merge commit is new, so no
+remote-tracking ref can contain it — while what the delete orphans is that one
+commit, both of whose parents stay exactly where they were. So the hook re-runs
+the merge: `git merge-tree` recomputes a tree from the two parents, and if it
+matches the tree the commit records, the commit holds nothing a plain
+`git merge` wouldn't produce again. A merge whose conflicts you settled by hand
+does **not** reproduce — that tree is authored work living nowhere else — so it
+keeps prompting, as does a branch carrying any ordinary commit of its own, an
+octopus merge, or a git too old for `merge-tree --write-tree` (2.38, 2022).
+Only `-D` and `--delete --force` get this; the force move/copy forms still ask
+on an unreachable tip.
+
+The checks are local `git` queries and never touch the network. They can
 only ever turn a prompt into an approval, and only on a positive answer — if git
 can't be reached, the branch won't resolve, or a `git -C`/`--git-dir` option
 points the command at a different repository than the one the queries read, the
@@ -262,10 +294,11 @@ delimiter (`<<'EOF'`, `<<"EOF"`, `<<\EOF`) suppresses all expansion, so its body
 is inert and always safe to drop. An unterminated or unparseable heredoc is left
 unchanged (the body lexes and the command defers) rather than guessed at.
 
-The **ask** rows assume an interactive or `default`-mode session. In a
-non-interactive mode (`auto`, `dontAsk`, `bypassPermissions`) the same commands
-return **deny** — equally blocking, with recoverable feedback for the agent
-instead of a prompt no one can answer. See [Configuration](#configuration).
+The **ask** rows assume a session where a prompt can be answered, which
+includes `auto`. In a mode where none can (`dontAsk`, `bypassPermissions`) the
+same commands return **deny** — equally blocking, with recoverable feedback for
+the agent instead of a prompt no one can answer. See
+[Configuration](#configuration).
 
 The two paths share the cause and differ in what they offer, so a denial is never
 mistaken for a prompt that is waiting to be answered:
@@ -275,8 +308,8 @@ ask   Push targets 'v1.3.0', not the worktree branch 'claude/x'
       — confirm before proceeding.
 
 deny  Push targets 'v1.3.0', not the worktree branch 'claude/x'
-      — branch-guard denied it: permission mode 'auto' has no way to prompt for
-      confirmation. Retrying won't help — either do it outside this session
+      — branch-guard denied it: permission mode 'dontAsk' has no way to prompt
+      for confirmation. Retrying won't help — either do it outside this session
       (e.g. run the command in a terminal), or re-run in an interactive
       permission mode.
 ```
@@ -305,6 +338,60 @@ probe follows symlinks and asks about the file the write lands on, so a link
 inside an ignored directory pointing at a tracked file still asks — a link to a
 genuinely ignored file stays exempt.
 
+## Break-glass: `BRANCH_GUARD_OVERRIDE`
+
+In `dontAsk` and `bypassPermissions` an **ask** becomes a **deny**, and a deny
+has no answer. That is right for a shared branch and wrong for a scratch one: the
+session still has work to do, so it does the work some other way. A session that
+couldn't run `git restore file.txt` edited the file back to its `HEAD` content by
+hand instead — same end state, no atomicity, no guarantee the result matched
+`HEAD`, and nothing in the log to review. Where no ungated equivalent exists (you
+cannot delete a branch by editing a file), the state is simply stranded.
+
+That session was in `auto`, which prompts now — so that example no longer plays
+out there. The prefix is for the modes that still cannot prompt.
+
+So one command prefix lifts an ask whose damage cannot leave this machine:
+
+```bash
+BRANCH_GUARD_OVERRIDE="reverting a superseded local change" git restore file.txt
+```
+
+The reason is **required** — a bare `BRANCH_GUARD_OVERRIDE=` lifts nothing — and
+it is echoed into the emitted decision, so the approval is on the record rather
+than silent. It is a command prefix rather than a `settings.json` variable because
+a `PreToolUse` hook inherits Claude Code's environment, not the one the command is
+about to run in; an env-var override could only be switched on for a whole
+session, by hand, which is the opposite of scoping it to the moment.
+
+**What it reaches.** Only these subcommands, each of which can lose local state
+and nothing else: `restore`, `switch`, `branch`, `tag`, `worktree`, `stash`,
+`reset`, `clean`, `config`, `reflog`, `filter-branch`, `gc`.
+
+**What it does not reach**, whatever reason you give:
+
+- **A protected branch.** `git reset --hard` on `main`, `git branch -D main`, a
+  commit or edit on `main` — the cause of the ask is a shared ref, and that class
+  of verdict is unliftable by construction, not by a list the override consults.
+  This includes anything you add to
+  [`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration).
+- **Anything that leaves this machine.** Every `git push` form and every `gh`
+  delete/disable. A push publishes; `gh repo delete` removes something other
+  people can see.
+- **A command that reaches further than the subcommand it was granted for.** An
+  output redirect to a file (`… > out`), a `git -c`/`--config-env` escape hatch
+  (which can run arbitrary code), and a `git -C`/`--git-dir` aimed at another
+  repository all keep the ask.
+- **A command carrying anything unrecognized.** The all-segments rule applies
+  unchanged, so `BRANCH_GUARD_OVERRIDE=… git clean -fd && rm -rf junk` still asks.
+  A safe segment alongside is fine: `… git status && git clean -fd` is lifted.
+
+A denial that the prefix *would* lift says so, so an agent can find the route
+without being told about it in advance. A denial it would not lift doesn't
+mention it, because a hint that fails a second time is the dead end the wording
+exists to avoid. The interactive prompt never mentions it either — approving the
+prompt is the shorter path.
+
 ## Push guard
 
 `git push` is evaluated according to the `BRANCH_GUARD_PUSH_POLICY` environment
@@ -327,7 +414,9 @@ can widen with [`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration), so
 **Tags.** Publishing a tag isn't a push of the worktree branch, so under `strict`
 it asks — whichever way it's spelled (`git push origin v1.3.0`,
 `git push origin refs/tags/v1.3.0`, `git push --tags`). Cutting a release is
-usually the one step worth a human keystroke. One gap is deliberate:
+usually the one step worth a human keystroke, and `auto` gives you one rather
+than a dead end (see [Configuration](#configuration)); creating the tag was
+never gated at all. One gap is deliberate:
 `git push --follow-tags` stays auto-approved, since it publishes only annotated
 tags already reachable from the branch being pushed, and `push.followTags` can
 turn on the same behavior from config where the hook can't see it. Under
@@ -361,6 +450,49 @@ protected set: `git push --force-with-lease=main origin HEAD:main` asks like any
 other push at `main`, and widening
 [`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration) withdraws the auto-approve
 for whatever you add.
+
+**Overlap with a moved base.** An auto-approved push is in bounds. That says
+nothing about the branch still being built on what it thinks it is. When the base
+has moved into the same *lines* this branch edits, the merge is going to come out
+wrong — and under a merge queue it comes out wrong late, after the queue has
+validated the candidate and spent a whole check cycle on it. So the auto-approve
+is withdrawn and the push asks, naming the files and the fix:
+
+```
+'origin/main' has moved since this branch left it, and its new commits edit the
+same lines this branch does in hooks/branch-guard.py — the merge is going to come
+out wrong, and a merge queue would spend a whole check cycle finding that.
+`git fetch && git rebase origin/main` finds it now — confirm before proceeding.
+```
+
+Both sides are diffed from the fork point, so both sets of line numbers are
+counted in that shared ancestor and can be compared at all. Hunks are read with
+`-U0` and widened by the three lines of context a hunk carries, so edits within
+six lines of each other meet and edits seven apart do not — sharing a *file* is
+not sharing an edit.
+
+The check runs only where a push would otherwise be auto-approved, so `protected`
+and `off` never reach it. Every probe fails silent: a detached HEAD, a shallow
+clone, an unresolvable base ref, a git too old for `merge-tree --write-tree`, or
+no `origin` at all costs a missed catch rather than a blocked push. `--dry-run`
+and `--delete` land nothing on the base, so neither is checked.
+
+Release branches are skipped by name — `release/*`, `hotfix-*`, `v2.1` and the
+rest of `BRANCH_GUARD_RELEASE_BRANCHES`. One is cut from the base and left
+diverged on purpose, so telling it to rebase would publish everything merged
+since the tag: a wrong answer rather than a noisy one. Nothing in the commit graph
+tells a release branch from a stale topic branch — both sit behind the base and
+ahead of the fork point — so the name is the only signal there is.
+
+Three settings tune it, all under [Configuration](#configuration):
+`BRANCH_GUARD_BASE_REF` (unset derives it from the clone's own `origin/HEAD`, so a
+`master`-default repo needs no config), `BRANCH_GUARD_OVERLAP_IGNORE` for paths a
+merge driver owns, and `BRANCH_GUARD_PUSH_OVERLAP_ENABLED=false` to switch the
+check off.
+
+This check came from [pipe-guard](https://github.com/karlkfi/claude-pipe-guard),
+which shipped it first. branch-guard parses `push` to destination-ref depth, so it
+lives here; pipe-guard keeps the matching `gh pr create` check.
 
 The push guard is **best-effort**: it parses the Bash command Claude runs (so it
 only governs Claude's `Bash` tool), and unusual refspecs may not be classified —
@@ -591,10 +723,10 @@ update step and restart.
    provably pure substitutions (`$(git rev-parse --show-toplevel)`,
    `$(git branch --show-current)`, `$(pwd)`) is exempt from that second downgrade
    — matched structurally, so only the exact read-only command qualifies.
-6. **Fail safe** in non-interactive modes: a would-be `ask` is emitted as `deny`,
-   since no human is present to answer the prompt. The reason names the mode and
-   says retrying won't help, so the agent hands off instead of re-running a
-   command that can't be approved from the session.
+6. **Fail safe** where no prompt can be shown (`dontAsk`, `bypassPermissions`):
+   a would-be `ask` is emitted as `deny`, since no human is present to answer it.
+   The reason names the mode and says retrying won't help, so the agent hands off
+   instead of re-running a command that can't be approved from the session.
 
 ## Agent guidance: avoiding prompts
 
@@ -639,6 +771,14 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   forms.
 - **Expect a prompt for destructive commands** (`reset --hard`, `clean -f`,
   `branch -D`, `restore <path>`, `config --global`) — that's by design.
+- **When a destructive command is denied and you meant it, say why rather than
+  working around it.** In a non-interactive mode that prompt is a denial with no
+  answer, and the tempting workaround — hand-editing a file back to its `HEAD`
+  content instead of `git restore` — is the unsafe path *and* the ungated one.
+  Re-run with a reason instead:
+  `BRANCH_GUARD_OVERRIDE="reverting a superseded local change" git restore file.txt`.
+  It works only for losses confined to this machine, so a push, a `gh` deletion,
+  or anything on main/master stays denied — for those, ask the human.
 ```
 
 ## Configuration
@@ -671,13 +811,62 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   commits and branch-sensitive mutations, the `Edit`/`Write` check, and the push
   guard's protected-target rule under both `strict` and `protected`.
 
-- **Non-interactive modes** — in `auto`, `dontAsk`, and `bypassPermissions` an
-  `ask` is automatically emitted as `deny` so the guard fails safe when no human
-  is present. The denial says so plainly (see [Behavior](#behavior)): there is no
+- **Push overlap** — on by default (see [Push guard](#push-guard)). Four knobs,
+  all optional:
+
+  ```json
+  {
+    "env": {
+      "BRANCH_GUARD_BASE_REF": "origin/main",
+      "BRANCH_GUARD_OVERLAP_IGNORE": "CHANGELOG.md,docs/roadmap.md",
+      "BRANCH_GUARD_RELEASE_BRANCHES": "ship/*",
+      "BRANCH_GUARD_PUSH_OVERLAP_ENABLED": "false"
+    }
+  }
+  ```
+
+  `BRANCH_GUARD_BASE_REF` names the integration ref this branch is measured
+  against. Leave it unset and the clone's own `origin/HEAD` answers it, so a
+  `master`-default repo works without configuration; a ref that doesn't resolve
+  switches the check off rather than blocking anything.
+
+  `BRANCH_GUARD_OVERLAP_IGNORE` is a comma-separated glob list for paths whose
+  overlap is expected — a changelog, or anything a custom merge driver owns, which
+  nearly every branch touches and which would otherwise fire on every push. The
+  discount is **conditional**: such a path still counts when `git merge-tree` says
+  the merge genuinely conflicts there, so an ignore entry suppresses the noise
+  without hiding a real collision.
+
+  `BRANCH_GUARD_RELEASE_BRANCHES` **extends** the built-in release-branch globs
+  rather than replacing them, the same way `BRANCH_GUARD_PROTECTED_BRANCHES` does.
+
+  `BRANCH_GUARD_PUSH_OVERLAP_ENABLED` switches the check off when set to `false`,
+  `0`, `no`, or `off`. Any other value — including one nobody meant as false —
+  leaves it on, so a typo costs a prompt somebody can answer rather than a guard
+  that quietly stopped running.
+
+- **Non-interactive modes** — in `dontAsk` and `bypassPermissions` an `ask` is
+  automatically emitted as `deny` so the guard fails safe when no human is
+  present. The denial says so plainly (see [Behavior](#behavior)): there is no
   confirmation to grant in this mode, so the way through is to run the command
-  yourself or re-run the session interactively. (Claude Code ignores hook
-  decisions entirely under `bypassPermissions`, so a hard guarantee there still
-  needs a git `pre-push` hook or server-side branch protection.)
+  yourself, re-run the session interactively, or — for the narrow set of asks it
+  covers — use the
+  [`BRANCH_GUARD_OVERRIDE` break-glass](#break-glass-branch_guard_override).
+  (Claude Code ignores hook decisions entirely under `bypassPermissions`, so a
+  hard guarantee there still needs a git `pre-push` hook or server-side branch
+  protection.)
+
+  **`auto` is not one of them.** The name suggests an unattended session and it
+  usually isn't one: an `ask` in `auto` reaches a real prompt, which somebody
+  answers. Denying it there removed the human rather than protecting them — a
+  session could create an annotated release tag and then never publish it, so
+  tagging always finished in a terminal instead.
+
+- **Break-glass** — `BRANCH_GUARD_OVERRIDE=<reason>` as a command prefix lifts an
+  ask whose damage stops at this machine. It is deliberately *not* a
+  `settings.json` variable, and it reaches no protected branch, no push, and no
+  `gh` deletion. See
+  [Break-glass: `BRANCH_GUARD_OVERRIDE`](#break-glass-branch_guard_override).
 
 ## Limitations
 
@@ -709,6 +898,20 @@ protected branch (main/master) or destructive git commands. To keep work flowing
   that branch. Add anything shared to
   [`BRANCH_GUARD_PROTECTED_BRANCHES`](#configuration); a branch with an open PR
   is not shared as far as the guard is concerned.
+- The [break-glass](#break-glass-branch_guard_override) is self-served: the agent
+  writes its own reason, and the guard checks only that one was given. It buys
+  legibility over the ungated alternative — the operation stays atomic and the
+  reason is recorded — not a second opinion. What keeps it bounded is its scope,
+  so treat "could this reach past this machine?" as the question when considering
+  a new entry.
+- The [push overlap check](#push-guard) reads local refs, so it trusts your last
+  `git fetch` — a base that moved since then looks unmoved, and the push is
+  auto-approved. It also compares line *ranges*, not semantics: two edits six
+  lines apart are reported as meeting whether or not they interact, and a rename
+  or a moved function reads as unrelated. Treat it as a cheap prompt to rebase,
+  not proof the merge is clean. One shape is deliberately excluded: a release
+  branch is skipped on its *name*, so a topic branch named like a release
+  (`hotfix-typo`) is never checked.
 - The [`git branch` recoverability check](#git-branch-what-the-session-owns-not-how-the-verb-looks)
   reads local refs only, so it trusts your last `git fetch`. A remote-tracking
   ref left stale after the branch was deleted upstream still counts as

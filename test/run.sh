@@ -34,6 +34,20 @@ if git -C "$REPO_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   fi
 fi
 
+# Claude Code reads hooks.json's `timeout` in *seconds* (default 600 for a
+# command hook), so a millisecond-shaped value is a ceiling hours away rather
+# than the backstop it looks like. The hook shells out to git, so a wedged repo
+# is a real hang; run_git's own 5s cap bounds each probe, and this is the outer
+# limit behind it. Assert a plausible seconds value — the unit is invisible in
+# the file itself, which is what let 10000 sit there reading as 10s.
+hook_timeout="$(jq -r '.hooks.PreToolUse[0].hooks[0].timeout' \
+  "$REPO_ROOT/hooks/hooks.json")"
+if [[ ! "$hook_timeout" =~ ^[0-9]+$ ]] || (( hook_timeout < 1 || hook_timeout > 600 )); then
+  printf 'hooks/hooks.json timeout is %s; must be seconds, 1..600\n' \
+    "${hook_timeout:-unset}" >&2
+  exit 1
+fi
+
 # Claude Code hands the hook native paths, so the fixtures must too. Under Git
 # Bash a path is `/d/a/repo/…`, which a native Python reads through ntpath —
 # where a leading slash is drive-relative, so the path lands on the hook
@@ -296,8 +310,8 @@ check "edit non-ignored path on main -> ask" ask \
   "$(decision_for "$(edit_payload Edit file_path "$WORK/file.txt")" "$REPO_ROOT")"
 #     The skip must not fire where no human could answer it either way — an
 #     ignored path defers rather than denying under a non-interactive mode.
-check "[auto] edit gitignored path on main -> none" none \
-  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/scratch.json" "" auto)" "$REPO_ROOT")"
+check "[dontAsk] edit gitignored path on main -> none" none \
+  "$(decision_for "$(edit_payload Write file_path "$WORK/tmp/scratch.json" "" dontAsk)" "$REPO_ROOT")"
 
 # 5e. The probe must answer about the file the write LANDS on. A symlink inside
 #     an ignored dir is itself ignored, but its target need not be — so probing
@@ -467,12 +481,12 @@ check "[default=strict] --no-force-with-lease cancels the lease -> ask" ask \
 # A lease naming a non-branch ref names no destination branch (section 7a).
 check "[default=strict] lease on a tag ref -> ask" ask \
   "$(decision_for "$(push 'git push --force-with-lease=refs/tags/v1 origin HEAD:refs/tags/v1')" "$WORK")"
-# The whole point of the relaxation is auto mode, where the ask it replaces was
-# a deny with no way to answer it — so pin both halves under 'auto'.
-check "[auto] leased rewrite of another branch -> allow" allow \
-  "$(decision_for "$(push_mode 'git push --force-with-lease=other origin HEAD:other' 'auto')" "$WORK")"
-check "[auto] cross-name push without a lease -> deny" deny \
-  "$(decision_for "$(push_mode 'git push origin HEAD:other' 'auto')" "$WORK")"
+# The relaxation earns the most where the ask it replaces cannot be answered at
+# all — so pin both halves under a mode that denies.
+check "[dontAsk] leased rewrite of another branch -> allow" allow \
+  "$(decision_for "$(push_mode 'git push --force-with-lease=other origin HEAD:other' 'dontAsk')" "$WORK")"
+check "[dontAsk] cross-name push without a lease -> deny" deny \
+  "$(decision_for "$(push_mode 'git push origin HEAD:other' 'dontAsk')" "$WORK")"
 # `protected` never auto-approves, so the lease must not leak a push into it.
 check "[protected] leased rewrite of another branch -> none" none \
   "$(decision_for "$(push 'git push --force-with-lease=other origin HEAD:other')" "$WORK" "$PROT")"
@@ -499,20 +513,41 @@ check "[protected] push --tags -> none" none \
 check "[off] push origin main -> none" none \
   "$(decision_for "$(push 'git push origin main')" "$WORK" "$OFF")"
 
-# 10. non-interactive ('auto') modes: a would-be ask becomes deny (fail safe),
-#     while allow and defer are unaffected.
-check "[auto] push origin main -> deny" deny \
-  "$(decision_for "$(push_mode 'git push origin main' 'auto')" "$WORK")"
+# 10. non-interactive modes: a would-be ask becomes deny (fail safe), while
+#     allow and defer are unaffected. `auto` is NOT one of them — its prompts
+#     reach a human, so it asks — and every fixture below pairs the two so the
+#     mode is pinned as the cause rather than the command.
+check "[dontAsk] push origin main -> deny" deny \
+  "$(decision_for "$(push_mode 'git push origin main' 'dontAsk')" "$WORK")"
 check "[bypassPermissions] push origin main -> deny" deny \
   "$(decision_for "$(push_mode 'git push origin main' 'bypassPermissions')" "$WORK")"
-check "[auto] worktree-branch push -> allow (unchanged)" allow \
-  "$(decision_for "$(push_mode 'git push' 'auto')" "$WORK")"
+check "[auto] push origin main -> ask (human present)" ask \
+  "$(decision_for "$(push_mode 'git push origin main' 'auto')" "$WORK")"
+check "[dontAsk] worktree-branch push -> allow (unchanged)" allow \
+  "$(decision_for "$(push_mode 'git push' 'dontAsk')" "$WORK")"
 check "[acceptEdits] push origin main -> ask (human present)" ask \
   "$(decision_for "$(push_mode 'git push origin main' 'acceptEdits')" "$WORK")"
 
+# 10a. Publishing a release from a session is the case that motivated treating
+#      `auto` as interactive (#33): the tag is created locally, and under the
+#      old set neither of the two steps that publish it could be approved, so a
+#      release always finished in the user's terminal. Both ask now, and both
+#      still deny where nobody can answer.
+check "[auto] tag push -> ask" ask \
+  "$(decision_for "$(push_mode 'git push origin v1.3.0' 'auto')" "$WORK")"
+check "[dontAsk] tag push -> deny" deny \
+  "$(decision_for "$(push_mode 'git push origin v1.3.0' 'dontAsk')" "$WORK")"
+check "[auto] push --tags -> ask" ask \
+  "$(decision_for "$(push_mode 'git push origin HEAD:main --tags' 'auto')" "$WORK")"
+# Creating the tag was never gated; pinned so the fix isn't credited to it.
+check "[auto] git tag -a -> allow (never gated)" allow \
+  "$(decision_for "$(push_mode 'git tag -a v1.3.0 -m v1.3.0' 'auto')" "$WORK")"
+
 # 11. non-interactive mode also converts a commit-on-protected ask to deny.
 git -C "$WORK" checkout -q main
-check "[auto] commit on main -> deny" deny \
+check "[dontAsk] commit on main -> deny" deny \
+  "$(decision_for "$(push_mode 'git commit -m x' 'dontAsk')" "$WORK")"
+check "[auto] commit on main -> ask" ask \
   "$(decision_for "$(push_mode 'git commit -m x' 'auto')" "$WORK")"
 git -C "$WORK" checkout -q claude/x
 
@@ -525,20 +560,27 @@ check_text "[default] tag push reason states the cause" has \
 check_text "[default] tag push reason invites confirmation" has \
   "— confirm before proceeding." "$tag_ask"
 
-tag_deny="$(reason_for "$(push_mode 'git push origin v1.3.0' 'auto')" "$WORK")"
-check_text "[auto] tag push deny keeps the cause" has \
+tag_deny="$(reason_for "$(push_mode 'git push origin v1.3.0' 'dontAsk')" "$WORK")"
+check_text "[dontAsk] tag push deny keeps the cause" has \
   "Push targets 'v1.3.0', not the worktree branch 'claude/x'" "$tag_deny"
-check_text "[auto] tag push deny is not confirm-shaped" lacks \
+check_text "[dontAsk] tag push deny is not confirm-shaped" lacks \
   "confirm before proceeding" "$tag_deny"
-check_text "[auto] tag push deny names the mode" has "permission mode 'auto'" "$tag_deny"
-check_text "[auto] tag push deny says retrying won't help" has \
+check_text "[dontAsk] tag push deny names the mode" has "permission mode 'dontAsk'" "$tag_deny"
+check_text "[dontAsk] tag push deny says retrying won't help" has \
   "Retrying won't help" "$tag_deny"
+# The mode is named from the payload, not hardcoded — so the denial a session
+# actually reads points at the mode that session is in.
+check_text "[bypassPermissions] tag push deny names its own mode" has \
+  "permission mode 'bypassPermissions'" \
+  "$(reason_for "$(push_mode 'git push origin v1.3.0' 'bypassPermissions')" "$WORK")"
 
 # The same wording split applies to every ask site, not just pushes.
 git -C "$WORK" checkout -q main
-check_text "[auto] commit-on-main deny is not confirm-shaped" lacks "confirm before proceeding" \
-  "$(reason_for "$(push_mode 'git commit -m x' 'auto')" "$WORK")"
-check_text "[auto] edit-on-main deny is not confirm-shaped" lacks "confirm before proceeding" \
+check_text "[dontAsk] commit-on-main deny is not confirm-shaped" lacks "confirm before proceeding" \
+  "$(reason_for "$(push_mode 'git commit -m x' 'dontAsk')" "$WORK")"
+check_text "[dontAsk] edit-on-main deny is not confirm-shaped" lacks "confirm before proceeding" \
+  "$(reason_for "$(edit_payload Edit file_path "$WORK/file.txt" "" dontAsk)" "$WORK")"
+check_text "[auto] edit-on-main ask invites confirmation" has "— confirm before proceeding." \
   "$(reason_for "$(edit_payload Edit file_path "$WORK/file.txt" "" auto)" "$WORK")"
 check_text "[default] edit-on-main ask invites confirmation" has "— confirm before proceeding." \
   "$(reason_for "$(edit_payload Edit file_path "$WORK/file.txt" "" default)" "$WORK")"
@@ -586,8 +628,8 @@ check "git checkout <ambiguous> -> none (defer)" none \
 printf 'dirty\n' >> "$WORK/file.txt"
 check "git reset --hard, dirty worktree -> ask" ask \
   "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
-check "[auto] git reset --hard, dirty worktree -> deny" deny \
-  "$(decision_for "$(push_mode 'git reset --hard' 'auto')" "$WORK")"
+check "[dontAsk] git reset --hard, dirty worktree -> deny" deny \
+  "$(decision_for "$(push_mode 'git reset --hard' 'dontAsk')" "$WORK")"
 git -C "$WORK" checkout -q -- file.txt
 check "git reset --hard, clean worktree on a recoverable branch -> allow" allow \
   "$(decision_for "$(bash_cmd 'git reset --hard HEAD~1')" "$WORK")"
@@ -676,8 +718,8 @@ check "git stash drop on main -> ask (still discards a stash)" ask \
 git -C "$WORK" checkout -q claude/x
 check "readonly + destructive chain -> ask" ask \
   "$(decision_for "$(bash_cmd 'git status && git clean -fd')" "$WORK")"
-check "[auto] git clean -fd -> deny" deny \
-  "$(decision_for "$(push_mode 'git clean -fd' 'auto')" "$WORK")"
+check "[dontAsk] git clean -fd -> deny" deny \
+  "$(decision_for "$(push_mode 'git clean -fd' 'dontAsk')" "$WORK")"
 
 # 15. Branch-sensitive mutations: feature -> allow, protected -> ask.
 check "git rebase on feature -> allow" allow \
@@ -1144,6 +1186,82 @@ check "git branch -d --force irrecoverable -> ask" ask \
 check "git branch --delete --force recoverable -> allow" allow \
   "$(decision_for "$(bash_cmd 'git branch --delete --force merged')" "$WORK")"
 
+#     A surviving tip is not the only way a delete can be in bounds. A scratch
+#     branch that merged an integration ref to see what would happen
+#     (`switch -c tmp; merge origin/main`) has an unreachable tip precisely
+#     BECAUSE it merged -- the merge commit is new -- while what it orphans is
+#     that one commit and nothing else. Re-running the merge is what separates
+#     "only a merge" from "nothing original": a hand-resolved conflict lives in
+#     the merge's tree and nowhere else, so a merge that does not reproduce
+#     keeps asking.
+#
+#     `side1`/`side2` are recoverable via remote-tracking refs, so every merge
+#     below orphans only itself and the fixtures differ in the one property
+#     under test.
+git -C "$WORK" checkout -q -b side1 main
+printf 'one\n' > "$WORK/side1.txt"
+git -C "$WORK" add side1.txt
+git -C "$WORK" commit -q -m "side one"
+git -C "$WORK" update-ref refs/remotes/origin/side1 \
+  "$(git -C "$WORK" rev-parse side1)"
+git -C "$WORK" checkout -q -b side2 main
+printf 'two\n' > "$WORK/side2.txt"
+git -C "$WORK" add side2.txt
+git -C "$WORK" commit -q -m "side two"
+git -C "$WORK" update-ref refs/remotes/origin/side2 \
+  "$(git -C "$WORK" rev-parse side2)"
+
+#     `testmerge` is the reported case: a clean two-parent merge of recoverable
+#     refs. `testmerge-plus` adds a commit of its own on top, so the delete
+#     orphans something no merge can account for.
+git -C "$WORK" checkout -q -b testmerge pushed
+git -C "$WORK" merge -q --no-edit side1
+git -C "$WORK" checkout -q -b testmerge-plus testmerge
+git -C "$WORK" commit -q --allow-empty -m "work only this branch has"
+
+#     `resolved` merges a genuine conflict and settles it by hand, so its tree
+#     is authored work that exists in no parent. `octo` has three parents, which
+#     `git merge-tree` cannot re-run at all.
+git -C "$WORK" checkout -q -b clash-a main
+printf 'a\n' > "$WORK/shared.txt"
+git -C "$WORK" add shared.txt
+git -C "$WORK" commit -q -m "clash a"
+git -C "$WORK" update-ref refs/remotes/origin/clash-a \
+  "$(git -C "$WORK" rev-parse clash-a)"
+git -C "$WORK" checkout -q -b clash-b main
+printf 'b\n' > "$WORK/shared.txt"
+git -C "$WORK" add shared.txt
+git -C "$WORK" commit -q -m "clash b"
+git -C "$WORK" update-ref refs/remotes/origin/clash-b \
+  "$(git -C "$WORK" rev-parse clash-b)"
+git -C "$WORK" checkout -q -b resolved clash-a
+git -C "$WORK" merge --no-edit clash-b >/dev/null 2>&1 || true
+printf 'resolved by hand\n' > "$WORK/shared.txt"
+git -C "$WORK" add shared.txt
+git -C "$WORK" commit -q --no-edit
+git -C "$WORK" checkout -q -b octo pushed
+git -C "$WORK" merge -q --no-edit side1 side2
+git -C "$WORK" checkout -q claude/x
+
+check "git branch -D a scratch test-merge -> allow" allow \
+  "$(decision_for "$(bash_cmd 'git branch -D testmerge')" "$WORK")"
+check "git branch -D a test-merge carrying its own commit -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D testmerge-plus')" "$WORK")"
+check "git branch -D a hand-resolved merge -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D resolved')" "$WORK")"
+check "git branch -D an octopus merge -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D octo')" "$WORK")"
+#     Reproducible and shared are independent, and only the second is the
+#     plugin's to judge -- so the proof must not reach past the protected check.
+#     The allow above is this pair's unset control.
+check "[configured] git branch -D a scratch test-merge -> ask" ask \
+  "$(decision_for "$(bash_cmd 'git branch -D testmerge')" "$WORK" \
+     'BRANCH_GUARD_PROTECTED_BRANCHES=testmerge')"
+#     The unattended mode is what the widening exists for: the reported session
+#     had no way to answer. Its other half is the `-D orphan` deny below.
+check "[dontAsk] git branch -D a scratch test-merge -> allow" allow \
+  "$(decision_for "$(push_mode 'git branch -D testmerge' 'dontAsk')" "$WORK")"
+
 #     Force move/copy: creating a new ref loses nothing; moving an existing one
 #     depends on whether its CURRENT tip survives elsewhere.
 check "git branch -f creating a backup ref -> allow" allow \
@@ -1174,8 +1292,8 @@ check "git -C other-repo branch -D -> ask" ask \
 #     Listing is untouched, and the unattended fail-safe still applies.
 check "git branch --list -> allow" allow \
   "$(decision_for "$(bash_cmd 'git branch -a -v')" "$WORK")"
-check "[auto] git branch -D irrecoverable -> deny" deny \
-  "$(decision_for "$(push_mode 'git branch -D orphan' 'auto')" "$WORK")"
+check "[dontAsk] git branch -D irrecoverable -> deny" deny \
+  "$(decision_for "$(push_mode 'git branch -D orphan' 'dontAsk')" "$WORK")"
 
 #     Wording: the reason has to say what is actually happening. `git branch -f`
 #     creating a ref was reported as "Deleting/renaming a git branch", which is
@@ -1250,8 +1368,8 @@ check "[protected] push origin release/1.2 -> none (unset)" none \
 check "[protected+configured] push origin release/1.2 -> ask" ask \
   "$(decision_for "$(push 'git push origin release/1.2')" "$WORK" "$PROT" "$BR")"
 # And a configured ask still becomes a deny where no human can answer.
-check "[protected+configured][auto] push origin integration -> deny" deny \
-  "$(decision_for "$(push_mode 'git push origin integration' 'auto')" "$WORK" "$PROT" "$BR")"
+check "[protected+configured][dontAsk] push origin integration -> deny" deny \
+  "$(decision_for "$(push_mode 'git push origin integration' 'dontAsk')" "$WORK" "$PROT" "$BR")"
 
 # `git branch`'s ownership tier (section 24) calls a target in bounds only when
 # it is recoverable AND private, and reads "private" from `is_protected` — so
@@ -1270,6 +1388,442 @@ check "[unset] leased rewrite of release/1.2 -> allow" allow \
 check "[configured] leased rewrite of release/1.2 -> ask" ask \
   "$(decision_for "$(push 'git push --force-with-lease=release/1.2 origin HEAD:release/1.2')" "$WORK" "$BR")"
 
+# 26. The `BRANCH_GUARD_OVERRIDE=<reason>` break-glass. An unanswerable `ask`
+#     in a non-interactive mode is a dead end, so the work reroutes onto
+#     whatever is ungated (hand-editing a file back to its HEAD content instead
+#     of `git restore`) or is abandoned. The prefix lifts an ask whose damage
+#     cannot leave this machine — and nothing else. Two independent locks keep
+#     it there: the subcommand must be in OVERRIDABLE_GIT, and the verdict must
+#     not be `ask-shared`. Both are crossed below, because covering each on its
+#     own would say nothing about the cell where an overridable subcommand
+#     meets a protected branch.
+#
+#     bash_mode COMMAND MODE -> a Bash payload carrying a permission_mode, with
+#     COMMAND json-encoded — the reason strings here contain spaces and quotes.
+bash_mode() {
+  jq -nc --arg cmd "$1" --arg mode "$2" \
+    '{tool_name: "Bash", tool_input: {command: $cmd}, permission_mode: $mode}'
+}
+OVR="BRANCH_GUARD_OVERRIDE='reverting a superseded local change'"
+
+#     26a. The case from the issue: `git restore` discarding worktree changes.
+check "restore --worktree, no override -> ask" ask \
+  "$(decision_for "$(bash_payload 'git restore file.txt')" "$WORK")"
+check "restore --worktree, overridden -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git restore file.txt")" "$WORK")"
+#     The pair the relaxation exists for: where no human can answer, the bare
+#     form is a deny with no route forward and the prefixed one goes through.
+#     `auto` is no longer such a mode — it prompts — so this pins `dontAsk`,
+#     with the `auto` ask beside it as the control.
+check "[dontAsk] restore --worktree, no override -> deny" deny \
+  "$(decision_for "$(bash_mode 'git restore file.txt' dontAsk)" "$WORK")"
+check "[dontAsk] restore --worktree, overridden -> allow" allow \
+  "$(decision_for "$(bash_mode "$OVR git restore file.txt" dontAsk)" "$WORK")"
+check "[auto] restore --worktree, no override -> ask" ask \
+  "$(decision_for "$(bash_mode 'git restore file.txt' auto)" "$WORK")"
+
+#     The approval stays on the record: the cause and the stated reason both
+#     survive into the emitted decision, so an allow is never anonymous.
+ovr_reason="$(reason_for "$(bash_payload "$OVR git restore file.txt")" "$WORK")"
+check_text "override allow keeps the original cause" has \
+  'discards working-tree changes' "$ovr_reason"
+check_text "override allow names the variable" has \
+  'BRANCH_GUARD_OVERRIDE is set' "$ovr_reason"
+check_text "override allow echoes the reason given" has \
+  'reverting a superseded local change' "$ovr_reason"
+
+#     A liftable deny names the prefix, so the agent learns the route from the
+#     denial rather than rerouting onto an ungated hand-edit. The interactive
+#     ask does not: a human answering the prompt is the shorter path, and
+#     advertising a bypass beside it is the wrong nudge.
+check_text "[dontAsk] liftable deny names the prefix" has \
+  'BRANCH_GUARD_OVERRIDE=<reason>' \
+  "$(reason_for "$(bash_mode 'git restore file.txt' dontAsk)" "$WORK")"
+check_text "[auto] liftable ask does not name the prefix" lacks \
+  'BRANCH_GUARD_OVERRIDE' \
+  "$(reason_for "$(bash_mode 'git restore file.txt' auto)" "$WORK")"
+check_text "interactive ask does not name the prefix" lacks \
+  'BRANCH_GUARD_OVERRIDE' \
+  "$(reason_for "$(bash_payload 'git restore file.txt')" "$WORK")"
+
+#     26b. The reason is mandatory. A bare `BRANCH_GUARD_OVERRIDE=` would be the
+#     switch-it-off spelling, which is the thing this is not.
+check "empty override reason -> ask" ask \
+  "$(decision_for "$(bash_payload 'BRANCH_GUARD_OVERRIDE= git restore file.txt')" "$WORK")"
+check "whitespace-only override reason -> ask" ask \
+  "$(decision_for "$(bash_payload "BRANCH_GUARD_OVERRIDE='   ' git restore file.txt")" "$WORK")"
+
+#     26c. Only a real command-prefix assignment counts. The name appearing as
+#     an argument — in a pathspec, a commit message, an echoed line — is a
+#     positional, and disarms nothing.
+check "override name as a positional -> ask" ask \
+  "$(decision_for "$(bash_payload 'git clean -fd BRANCH_GUARD_OVERRIDE=why')" "$WORK")"
+check "override name echoed in another segment -> ask" ask \
+  "$(decision_for "$(bash_payload 'echo BRANCH_GUARD_OVERRIDE=why && git clean -fd')" "$WORK")"
+
+#     26d. Lock one: the subcommand must be in OVERRIDABLE_GIT. Everything that
+#     leaves this machine is outside it, whatever reason is given.
+check "override on a push to another branch -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git push origin other")" "$WORK")"
+check "override on a tag publish -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git push --tags")" "$WORK")"
+check "override on gh repo delete -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR gh repo delete owner/repo")" "$WORK")"
+check "override on gh pr close --delete-branch -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR gh pr close 1 --delete-branch")" "$WORK")"
+check "override on gh api DELETE of a ref -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR gh api -X DELETE repos/o/r/git/refs/heads/x")" "$WORK")"
+#     A push's deny must not advertise a prefix that would be refused again.
+check_text "[dontAsk] unliftable deny stays silent about the prefix" lacks \
+  'BRANCH_GUARD_OVERRIDE' \
+  "$(reason_for "$(bash_mode 'git push origin other' dontAsk)" "$WORK")"
+
+#     26e. Lock two: an `ask-shared` verdict — the cause is a protected branch —
+#     is unliftable even for a subcommand that is otherwise in bounds. This is
+#     the crossed cell: `reset --hard` and `branch -D` are both overridable
+#     subcommands, and both stay gated once the ref is shared.
+git -C "$WORK" checkout -q main
+check "override on reset --hard on main -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git reset --hard HEAD~1")" "$WORK")"
+check "[dontAsk] override on reset --hard on main -> deny" deny \
+  "$(decision_for "$(bash_mode "$OVR git reset --hard HEAD~1" dontAsk)" "$WORK")"
+git -C "$WORK" checkout -q claude/x
+check "override on branch -D main -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git branch -D main")" "$WORK")"
+#     The configured set reaches the override boundary too, with the unset
+#     control beside it: release/1.2 is recoverable, so only privacy moves —
+#     unset it allows outright, configured it asks and the override can't help.
+check "[unset] override on branch -D release/1.2 -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git branch -D release/1.2")" "$WORK")"
+check "[configured] override on branch -D release/1.2 -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git branch -D release/1.2")" "$WORK" "$BR")"
+
+#     26f. The three exclusions in `is_overridable`, each of which would let the
+#     override reach past the subcommand it was granted for.
+check "override with an output redirect to a file -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd > out.txt")" "$WORK")"
+check "override with a -c escape hatch -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git -c core.pager=x clean -fd")" "$WORK")"
+check "override aimed at another repo -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git -C /somewhere/else clean -fd")" "$WORK")"
+
+#     26g. The all-segments rule holds identically for an overridden allow: a
+#     command is lifted only when every other segment is recognized-safe, so
+#     nothing rides the override in.
+check "override with a trailing non-git segment -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd && rm -rf junk")" "$WORK")"
+check "override with a command substitution -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd \"\$(cat /etc/passwd)\"")" "$WORK")"
+check "override with one liftable and one unliftable ask -> ask" ask \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd && git push origin other")" "$WORK")"
+#     A safe git segment ahead of the liftable one still allows, as it would
+#     without the override.
+check "override after a read-only git segment -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git status && git clean -fd")" "$WORK")"
+check "override piped to a read-only filter -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd | head -5")" "$WORK")"
+
+#     26h. The rest of the local-loss tier, so the set is exercised rather than
+#     asserted. Each of these loses only state this machine holds.
+check "override on clean -fd -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git clean -fd")" "$WORK")"
+check "override on stash drop -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git stash drop")" "$WORK")"
+check "override on an irrecoverable branch -D -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git branch -D reset-orphan")" "$WORK")"
+check "override on tag -d -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git tag -d v1")" "$WORK")"
+check "override on worktree remove --force -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git worktree remove --force ../wt")" "$WORK")"
+check "override on config --global -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git config --global user.name x")" "$WORK")"
+check "override on switch --discard-changes -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git switch --discard-changes main")" "$WORK")"
+check "override on reflog expire -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git reflog expire --all")" "$WORK")"
+check "override on filter-branch -> allow" allow \
+  "$(decision_for "$(bash_payload "$OVR git filter-branch --tree-filter x")" "$WORK")"
+
+#     26i. The override adds no path where none existed: a defer stays a defer
+#     (normal permissions still apply), and the edit path is gated only by the
+#     protected branch, which the override never reaches.
+check "override on a deferring subcommand -> none" none \
+  "$(decision_for "$(bash_payload "$OVR git reset --soft HEAD~1")" "$WORK")"
+git -C "$WORK" checkout -q main
+check "override does not reach the edit path on main -> ask" ask \
+  "$(decision_for "$(edit_payload Edit file_path "$WORK/file.txt")" "$WORK")"
+git -C "$WORK" checkout -q claude/x
+
+# 27. Push overlap. A `strict` auto-approve says the push is in bounds; it says
+#     nothing about the branch still being built on what it thinks it is. When
+#     the base has moved into the same LINES this branch edits, the auto-approve
+#     is withdrawn and the push asks.
+#
+#     Every case here needs a repo whose `origin/main` has moved independently of
+#     the branch, which `make_overlap_repo` builds by writing the ref straight
+#     into refs/remotes — nothing touches a network. The negative direction
+#     carries the weight: an overlap reported where there is none sends a session
+#     off to rebase a branch that did not need it, so the "no overlap" cells are
+#     the ones worth crossing.
+OVL="$(mktemp -d "$REPO_ROOT/tmp/overlap-repo.XXXXXX")"
+cleanup() {
+  rm -rf "$WORK" ${OUTSIDE:+"$OUTSIDE"} ${OVL:+"$OVL"}
+}
+
+# numbered PATH LINE MARKER -> 40 numbered lines, with LINE replaced by MARKER
+# (LINE 0 replaces nothing). Written whole rather than patched in place: BSD and
+# GNU `sed -i` take different arguments, and this suite runs on both.
+numbered() {
+  local out="$1" target="$2" marker="$3" i
+  : > "$out"
+  for i in $(seq 1 40); do
+    if [[ "$i" == "$target" ]]; then
+      printf '%s\n' "$marker" >> "$out"
+    else
+      printf 'line %d\n' "$i" >> "$out"
+    fi
+  done
+}
+
+# make_overlap_repo BRANCH BASE_FILE BASE_LINE BRANCH_FILE BRANCH_LINE
+#   BRANCH forks from main, then the base moves on top of that fork point and is
+#   published as refs/remotes/origin/main. BASE_LINE 0 leaves the base exactly
+#   where the branch left it, which is the control that makes an overlap
+#   assertion mean something.
+make_overlap_repo() {
+  local branch="$1" bfile="$2" bline="$3" wfile="$4" wline="$5"
+  rm -rf "$OVL"
+  mkdir -p "$OVL"
+  git -C "$OVL" init -q -b main
+  git -C "$OVL" config user.name "Test"
+  git -C "$OVL" config user.email "test@example.com"
+  numbered "$OVL/file.txt" 0 ''
+  numbered "$OVL/other.txt" 0 ''
+  numbered "$OVL/driver.txt" 0 ''
+  git -C "$OVL" add -A
+  git -C "$OVL" commit -q -m "init"
+  if [[ "$bline" != 0 ]]; then
+    git -C "$OVL" switch -q -c base-work
+    numbered "$OVL/$bfile" "$bline" "base edit"
+    git -C "$OVL" commit -q -am "base moves"
+  fi
+  git -C "$OVL" update-ref refs/remotes/origin/main HEAD
+  git -C "$OVL" switch -q main
+  git -C "$OVL" switch -q -c "$branch"
+  numbered "$OVL/$wfile" "$wline" "branch edit"
+  git -C "$OVL" commit -q -am "branch work"
+}
+
+ENABLED_OFF='BRANCH_GUARD_PUSH_OVERLAP_ENABLED=false'
+
+# 27a. The core pair. Same file, same line, base moved -> ask; the identical
+#      branch against a base that never moved -> allow. Without the second half
+#      the first proves only that something asked.
+make_overlap_repo claude/x file.txt 10 file.txt 10
+check "[overlap] base moved into the same line -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+check "[overlap] same, push origin HEAD -> ask" ask \
+  "$(decision_for "$(push 'git push origin HEAD')" "$OVL")"
+check_text "[overlap] reason names the file" has "file.txt" \
+  "$(reason_for "$(push 'git push')" "$OVL")"
+check_text "[overlap] reason names the base ref" has "origin/main" \
+  "$(reason_for "$(push 'git push')" "$OVL")"
+check_text "[overlap] reason offers the rebase" has "git rebase origin/main" \
+  "$(reason_for "$(push 'git push')" "$OVL")"
+check_text "[overlap] ask still invites a confirmation" has "confirm before proceeding" \
+  "$(reason_for "$(push 'git push')" "$OVL")"
+
+make_overlap_repo claude/x file.txt 0 file.txt 10
+check "[overlap] base has not moved -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+
+# 27b. Ranges, not paths. Context is 3 lines either side, so hunks 4 apart meet
+#      and hunks 7 apart do not — sharing a file is not sharing an edit.
+make_overlap_repo claude/x file.txt 10 file.txt 14
+check "[overlap] edits 4 lines apart -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo claude/x file.txt 10 file.txt 17
+check "[overlap] edits 7 lines apart -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo claude/x file.txt 10 other.txt 10
+check "[overlap] different files, same line number -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+
+# 27c. Flags that land nothing on the base have no overlap to have. Both
+#      spellings, long and bundled-short, against the repo that otherwise asks.
+make_overlap_repo claude/x file.txt 10 file.txt 10
+check "[overlap] --dry-run -> allow" allow \
+  "$(decision_for "$(push 'git push --dry-run')" "$OVL")"
+check "[overlap] -n -> allow" allow \
+  "$(decision_for "$(push 'git push -n')" "$OVL")"
+check "[overlap] --delete of the worktree branch -> allow" allow \
+  "$(decision_for "$(push 'git push --delete origin claude/x')" "$OVL")"
+
+# 27d. The check only ever withdraws an auto-approve. Under `protected` and
+#      `off` the push was never auto-approved, so it stays exactly as silent as
+#      before — the overlap must not introduce a prompt where there was none.
+check "[overlap] protected policy is untouched -> none" none \
+  "$(decision_for "$(push 'git push')" "$OVL" $PROT)"
+check "[overlap] off policy is untouched -> none" none \
+  "$(decision_for "$(push 'git push')" "$OVL" $OFF)"
+
+# 27e. A protected target is answered first, so the overlap never reaches it and
+#      the prompt still says why it really asked.
+git -C "$OVL" switch -q main
+check "[overlap] push to main still asks as shared" ask \
+  "$(decision_for "$(push 'git push origin main')" "$OVL")"
+check_text "[overlap] protected reason wins over the overlap" has \
+  "protected branch 'main'" "$(reason_for "$(push 'git push origin main')" "$OVL")"
+git -C "$OVL" switch -q claude/x
+
+# 27f. An overlap is a property of the push, not of what is chained to it, so it
+#      survives a segment that would otherwise drop the command to a defer —
+#      `git push && rm -rf foo` asks here rather than deferring. Pinned because
+#      it is the one place the overlap adds a prompt rather than withdrawing an
+#      approval, and because a defer would lose the catch outright in a session
+#      that has allowlisted `git push`. The control below is the same chain in a
+#      repo with no overlap, which still defers.
+check "[overlap] push && rm -> ask" ask \
+  "$(decision_for "$(push 'git push && rm -rf foo')" "$OVL")"
+check_text "[overlap] the chained ask still names the overlap" has "file.txt" \
+  "$(reason_for "$(push 'git push && rm -rf foo')" "$OVL")"
+check "[overlap] push && rm without an overlap -> none" none \
+  "$(decision_for "$(push 'git push && rm -rf foo')" "$WORK")"
+
+# 27g. Unattended, the ask becomes a deny — paired with the `auto` control, since
+#      a suite that only pinned the deny would pass with `auto` back in the
+#      non-interactive set. No push form is overridable, so the denial names no
+#      break-glass.
+check "[overlap] dontAsk -> deny" deny \
+  "$(decision_for "$(push_mode 'git push' dontAsk)" "$OVL")"
+check "[overlap] auto still asks" ask \
+  "$(decision_for "$(push_mode 'git push' auto)" "$OVL")"
+check_text "[overlap] deny does not offer a confirmation" lacks \
+  "confirm before proceeding" "$(reason_for "$(push_mode 'git push' dontAsk)" "$OVL")"
+check_text "[overlap] deny advertises no break-glass" lacks \
+  "BRANCH_GUARD_OVERRIDE=<reason>" "$(reason_for "$(push_mode 'git push' dontAsk)" "$OVL")"
+
+# 27h. Opting out, with the unset control beside it that pins the env var as the
+#      cause. Only a false spelling disables: a value nobody meant as false must
+#      leave the check running, or a typo silently stops the guard.
+check "[overlap] ENABLED=false -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" $ENABLED_OFF)"
+check "[overlap] ENABLED=0 -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" BRANCH_GUARD_PUSH_OVERLAP_ENABLED=0)"
+check "[overlap] ENABLED=true -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL" BRANCH_GUARD_PUSH_OVERLAP_ENABLED=true)"
+check "[overlap] ENABLED=garbage still asks" ask \
+  "$(decision_for "$(push 'git push')" "$OVL" BRANCH_GUARD_PUSH_OVERLAP_ENABLED=maybe)"
+check "[overlap] unset control -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+
+# 27i. A release branch is cut from the base and left diverged on purpose, so
+#      telling it to rebase would publish everything merged since the tag — a
+#      wrong answer, not a noisy one. Defaults, then the configured extension,
+#      each with the control that makes it mean something.
+make_overlap_repo release/1.2 file.txt 10 file.txt 10
+check "[overlap] release/1.2 is skipped -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo hotfix-9 file.txt 10 file.txt 10
+check "[overlap] hotfix-9 is skipped -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo v2.1 file.txt 10 file.txt 10
+check "[overlap] v2.1 is skipped -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo ship/9 file.txt 10 file.txt 10
+check "[overlap] ship/9 is not a default release name -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+check "[overlap] configured release glob skips it -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_RELEASE_BRANCHES=ship/*')"
+# Extend-only: naming one extra pattern must not drop the built-in ones.
+make_overlap_repo release/1.2 file.txt 10 file.txt 10
+check "[overlap] a configured glob EXTENDS the defaults -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_RELEASE_BRANCHES=ship/*')"
+
+# 27j. base_ref. An unresolvable one fails silent rather than blocking, and a
+#      configured one is measured instead of origin/main — the pair pins that
+#      the env var is what moved the answer.
+make_overlap_repo claude/x file.txt 10 file.txt 10
+check "[overlap] unresolvable base_ref -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" BRANCH_GUARD_BASE_REF=origin/nope)"
+git -C "$OVL" update-ref refs/remotes/upstream/trunk refs/remotes/origin/main
+check "[overlap] configured base_ref is measured -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL" BRANCH_GUARD_BASE_REF=upstream/trunk)"
+check_text "[overlap] reason names the configured base" has "upstream/trunk" \
+  "$(reason_for "$(push 'git push')" "$OVL" BRANCH_GUARD_BASE_REF=upstream/trunk)"
+
+# 27k. overlap_ignore, crossed against whether the merge actually conflicts. A
+#      path a merge driver owns is contended by construction, so counting its
+#      ranges would fire on every push — but the discount is CONDITIONAL, and a
+#      path git refuses to merge still counts. Both cells, each with its unset
+#      control.
+make_overlap_repo claude/x driver.txt 10 driver.txt 12
+check "[overlap] ignored path, ranges meet, merge clean -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_OVERLAP_IGNORE=driver.txt')"
+check "[overlap] same repo without the ignore -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+make_overlap_repo claude/x driver.txt 10 driver.txt 10
+check "[overlap] ignored path whose merge conflicts -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_OVERLAP_IGNORE=driver.txt')"
+make_overlap_repo claude/x driver.txt 10 driver.txt 12
+check "[overlap] ignore glob rather than exact name -> allow" allow \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_OVERLAP_IGNORE=driver.*')"
+check "[overlap] an ignore glob matching nothing changes nothing -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL" 'BRANCH_GUARD_OVERLAP_IGNORE=nope.*')"
+
+# 27l. The probes read the SESSION cwd, so a `git -C` pointing elsewhere would
+#      measure the wrong repository — the same reason the `git branch` probes
+#      are gated on it. The overlap is skipped and the push keeps the verdict it
+#      already had.
+make_overlap_repo claude/x file.txt 10 file.txt 10
+check "[overlap] git -C another repo skips the probe -> allow" allow \
+  "$(decision_for "$(bash_payload "git -C '$(nat "$WORK")' push")" "$OVL")"
+
+# 27m. A removed line that itself begins with `--` comes out of a unified diff as
+#      `--- …`, which is content rather than a file header. Reading one as a
+#      header files every LATER hunk in that file under a path that does not
+#      exist, so a real overlap goes unseen and the push sails through. The
+#      misfiling only shows with a second hunk after the fake header, which is
+#      why this deletes a `-- ` line near the top AND edits line 30: with the
+#      header run respected both hunks land under q.sql and the line-30 edit
+#      meets the base's; without it, only the deletion does and the answer flips
+#      to allow.
+sql_lines() {   # sql_lines PATH keep|drop LINE30
+  local out="$1" comment="$2" marker="$3" i
+  : > "$out"
+  for i in $(seq 1 40); do
+    if [[ "$i" == 10 ]]; then
+      [[ "$comment" == keep ]] && printf -- '-- DROP TABLE users\n' >> "$out"
+    elif [[ "$i" == 30 ]]; then
+      printf '%s\n' "$marker" >> "$out"
+    else
+      printf 'line %d\n' "$i" >> "$out"
+    fi
+  done
+  return 0
+}
+
+rm -rf "$OVL"
+mkdir -p "$OVL"
+git -C "$OVL" init -q -b main
+git -C "$OVL" config user.name "Test"
+git -C "$OVL" config user.email "test@example.com"
+sql_lines "$OVL/q.sql" keep 'line 30'
+git -C "$OVL" add -A
+git -C "$OVL" commit -q -m "init"
+git -C "$OVL" switch -q -c base-work
+sql_lines "$OVL/q.sql" keep 'base edit'
+git -C "$OVL" commit -q -am "base moves"
+git -C "$OVL" update-ref refs/remotes/origin/main HEAD
+git -C "$OVL" switch -q main
+git -C "$OVL" switch -q -c claude/x
+sql_lines "$OVL/q.sql" drop 'branch edit'
+git -C "$OVL" commit -q -am "branch work"
+check "[overlap] a removed '-- ' line is content, not a file header -> ask" ask \
+  "$(decision_for "$(push 'git push')" "$OVL")"
+check_text "[overlap] the hunk is filed under the real path" has "q.sql" \
+  "$(reason_for "$(push 'git push')" "$OVL")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 
 # A FLOOR, not an exact count. The suite used to assert its own size against a
@@ -1284,7 +1838,7 @@ printf '\n%d passed, %d failed\n' "$pass" "$fail"
 # silently collapses, because setup failed or a section exited early -- while
 # conflicting with nobody. Raise it when the suite grows a lot; nothing breaks
 # if it lags.
-CASE_FLOOR=280
+CASE_FLOOR=430
 counts_ok=1
 if [[ $((pass + fail)) -lt "$CASE_FLOOR" ]]; then
   printf 'suite ran %d cases, under the floor of %d — did setup fail, or a section exit early?\n' \
