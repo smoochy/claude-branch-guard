@@ -431,6 +431,43 @@ HUNK_RE = re.compile(r'^@@ -([0-9]+)(?:,([0-9]+))? \+')
 # denies; `auto` asks.
 NON_INTERACTIVE_MODES = frozenset({'dontAsk', 'bypassPermissions'})
 
+# Opens every ask and every deny, ahead of the cause. Claude Code attributes
+# neither to the plugin that wrote it, so this opener is the only part of the
+# text naming the guard — and with sibling guards installed alongside it, an
+# unattributed "Targets protected branch 'main'" tells the reader nothing about
+# who to answer, configure, or file against.
+#
+# The two paths need it for different reasons. A deny leaves no record in the
+# decision stream — Claude Code persists a hook's stdout only for a call it goes
+# on to run — so the error text handed back to the agent is the only trace it
+# left. An ask does leave a record, but the human is reading the permission
+# prompt rather than the record, and the prompt is the reason text alone. That
+# distinction is what #101's wording missed: `hookName` and the hook `command`
+# do attribute an ask, to whoever holds the decision stream, and the person the
+# ask is actually addressed to is not holding it.
+#
+# foreground-guard 0.5.1 reads the deny half as a cross-guard contract, keyed on
+# `^(?:Error:\s*)?([a-z0-9-]+-guard):\s` (its scripts/friction-report.py), so
+# the colon and the trailing space are both load-bearing and a guard wording
+# this differently under-counts its own denies under `--plugin all`. That regex
+# runs only over tool-result error text, so prefixing asks adds nothing to that
+# count: the same report reads an ask from the recorded decision and attributes
+# it by hook `command`, never by this opener.
+#
+# `allow` is deliberately excluded. It surfaces as neither prose channel — it
+# suppresses the prompt and is handed back to nobody — so it is read only by
+# something already holding the record that attributes it.
+#
+# Applied in `emit()` rather than at the call sites, so the attribution is a
+# property of the wire format and a later ask or deny cannot be added without it.
+GUARD_PREFIX = 'branch-guard: '
+
+# The verdicts GUARD_PREFIX opens: the two that reach a reader as prose.
+# `additionalContext` takes it unconditionally instead of by verdict — it rides
+# an ask only, and it is the one field that lands in the model's context with
+# nothing around it, so an unprefixed paragraph reads as the session's own.
+PREFIXED_DECISIONS = frozenset({'ask', 'deny'})
+
 # Break-glass command prefix: `BRANCH_GUARD_OVERRIDE=<reason> git clean -fd`.
 # Read from the COMMAND STRING, not the hook process environment, because that
 # is the only form a session can set per command — a PreToolUse hook inherits
@@ -1176,8 +1213,9 @@ def push_overlap_reason(base, paths):
 def push_overlap_context(reason):
     """The model-facing half of an overlap ask — see `confirm()` for why this
     verdict has one and no other does. The cause names work for the model to do,
-    so it has to survive the human answering the prompt."""
-    return (f"branch-guard stopped this push to ask about a stale base: {reason}. "
+    so it has to survive the human answering the prompt. The opener comes from
+    `emit()`, as it does for a reason, so nothing here names the guard."""
+    return (f"this push was stopped to ask about a stale base. {reason}. "
             f"The prompt goes to the user, not to you — so whichever way it is "
             f"answered, rebase before treating this branch's merge as sound.")
 
@@ -1218,14 +1256,14 @@ def overwrite_verdict(cwd, name, what, probe):
     if not probe:
         return ('ask', f"{what} can move an existing branch pointer, and a "
                        f"`git -C`/`--git-dir` option points at another "
-                       f"repository, so branch-guard can't check what "
+                       f"repository, so this guard can't check what "
                        f"'{name}' currently points at")
     exists = branch_exists(cwd, name)
     if exists is False:
         return ('allow', None)        # creates a new ref — nothing to overwrite
     if exists is None:
         return ('ask', f"{what} can move an existing branch pointer, and "
-                       f"branch-guard couldn't resolve '{name}'")
+                       f"this guard couldn't resolve '{name}'")
     rec = tip_is_recoverable(cwd, name)
     if rec is True:
         return ('allow', None)
@@ -1233,7 +1271,7 @@ def overwrite_verdict(cwd, name, what, probe):
         return ('ask', f"{what} moves existing branch '{name}', whose current "
                        f"tip isn't reachable from any remote-tracking branch "
                        f"or main")
-    return ('ask', f"{what} moves existing branch '{name}', and branch-guard "
+    return ('ask', f"{what} moves existing branch '{name}', and this guard "
                    f"couldn't check whether its current tip survives elsewhere")
 
 
@@ -1325,7 +1363,7 @@ def classify_branch(flags, short, pos, current, cwd, probe):
         if not probe:
             return ('ask', "`git branch -D` force-deletes a branch, and a "
                            "`git -C`/`--git-dir` option points at another "
-                           "repository, so branch-guard can't check whether "
+                           "repository, so this guard can't check whether "
                            "the commits survive elsewhere")
         # `-r` deletes a remote-tracking ref (`git branch -rD origin/x`). Such a
         # target sits under refs/remotes, so it satisfies the reachability check
@@ -1346,7 +1384,7 @@ def classify_branch(flags, short, pos, current, cwd, probe):
                                f"tip isn't reachable from any remote-tracking "
                                f"branch or main")
             return ('ask', f"`git branch -D` force-deletes '{b}', and "
-                           f"branch-guard couldn't check whether its commits "
+                           f"this guard couldn't check whether its commits "
                            f"survive elsewhere")
         return ('allow', None)
 
@@ -1389,7 +1427,7 @@ def classify_reset(branch, cwd, probe):
     if not probe:
         return ('ask', "`git reset --hard` discards changes, and a "
                        "`git -C`/`--git-dir` option points at another "
-                       "repository, so branch-guard can't check that one")
+                       "repository, so this guard can't check that one")
     if worktree_is_clean(cwd) is not True:
         return ('ask', "`git reset --hard` discards uncommitted changes to "
                        "tracked files")
@@ -1887,13 +1925,15 @@ def is_protected(branch):
 
 
 def emit(decision, reason, context=None):
+    if decision in PREFIXED_DECISIONS:
+        reason = GUARD_PREFIX + reason
     out = {
         "hookEventName": "PreToolUse",
         "permissionDecision": decision,
         "permissionDecisionReason": reason,
     }
     if context:
-        out["additionalContext"] = context
+        out["additionalContext"] = GUARD_PREFIX + context
     print(json.dumps({"hookSpecificOutput": out}))
 
 
@@ -1907,7 +1947,9 @@ def confirm(reason, mode, liftable=False, context=None):
     says plainly that there is none — a denial worded "confirm before
     proceeding" reads as a prompt waiting to be answered, so an agent retries a
     command that cannot succeed in this session until it gives up. Name the
-    mode, and give the routes that do work.
+    mode, and give the routes that do work. The guard names itself only once, in
+    `emit()`, which opens both paths with `GUARD_PREFIX` — so nothing here
+    repeats it on either.
 
     `liftable` says the break-glass would be honored for this exact command, so
     the denial names it. The caller passes it only after checking the whole
@@ -1923,7 +1965,15 @@ def confirm(reason, mode, liftable=False, context=None):
     channel that does reach the model, and it is queued while the hook's output
     is read, before the prompt exists, so it lands whichever way the human
     answers. The `deny` path needs none: a denial delivers `reason` to the model
-    already, and repeating it there would only say the same thing twice."""
+    already, and repeating it there would only say the same thing twice.
+
+    A context opens with `GUARD_PREFIX` too, and takes it in `emit()` for the
+    same reason a reason does: the attribution belongs to the wire format rather
+    than to whichever helper built the paragraph. This is the one field that
+    lands in the model's context with nothing around it — no prompt, no tool
+    error — so an unprefixed paragraph is indistinguishable from the session's
+    own reasoning or from a sibling guard's. A builder like
+    `push_overlap_context` therefore names the guard nowhere else."""
     if mode in NON_INTERACTIVE_MODES:
         routes = (f"Retrying as-is won't help — re-run it prefixed with "
                   f"`{OVERRIDE_VAR}=<reason>` if the loss is deliberate, or do "
@@ -1932,8 +1982,8 @@ def confirm(reason, mode, liftable=False, context=None):
                   "Retrying won't help — either do it outside this session "
                   "(e.g. run the command in a terminal), or re-run in an "
                   "interactive permission mode.")
-        emit('deny', f"{reason} — branch-guard denied it: permission mode "
-                     f"'{mode}' has no way to prompt for confirmation. {routes}")
+        emit('deny', f"{reason} — denied because permission mode '{mode}' has "
+                     f"no way to prompt for confirmation. {routes}")
         return
     emit('ask', f"{reason} — confirm before proceeding.", context)
 
